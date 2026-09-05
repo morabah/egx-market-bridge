@@ -1,0 +1,51 @@
+{
+  "provider_mode": "delayed",
+  "base_url": "https://ticker.egidegypt.com",
+  "swagger_url": "https://ticker.egidegypt.com/swagger/v1/swagger.json",
+  "symbols": ["MASR", "LUTS", "RAYA", "COMI"],
+  "focus_symbols": ["MASR", "COMI"],
+  "poll_seconds": 120,
+  "request_timeout_seconds": 15,
+  "output_dir": "./output",
+  "database_path": "./output/egx_bridge.sqlite",
+  "collect_depth": true,
+  "collect_trades": true,
+  "collect_chart": true,
+  "max_trade_rows": 5000,
+  "session_only": false,
+  "cairo_timezone": "Africa/Cairo",
+  "raw_retention_days": 14,
+  "rate_limit_seconds": 0.5,
+  "collect_multi_provider_quotes": true,
+  "candle_intervals": ["1d", "5m", "15m", "1h"],
+  "enabled_providers": {
+    "egid": true,
+    "yahoo": true,
+    "tradingview": true,
+    "borsa": false,
+    "investor_egx": true
+  },
+  "provider_priority": {
+    "intraday_ohlcv": ["egid", "tradingview", "borsa", "yahoo"],
+    "daily_ohlcv": ["egid", "yahoo", "tradingview", "borsa"],
+    "quote": ["egid", "tradingview", "borsa", "yahoo"],
+    "depth": ["egid"],
+    "trades": ["egid"],
+    "fundamentals": ["investor_egx"],
+    "market_universe": ["borsa", "investor_egx"]
+  },
+  "symbol_aliases": {
+    "MASR": {"yahoo": "MASR.CA", "tradingview": "EGX:MASR", "egid": "MASR", "borsa": "MASR"},
+    "COMI": {"yahoo": "COMI.CA", "tradingview": "EGX:COMI", "egid": "COMI", "borsa": "COMI"},
+    "RAYA": {"yahoo": "RAYA.CA", "tradingview": "EGX:RAYA", "egid": "RAYA", "borsa": "RAYA"},
+    "LUTS": {"yahoo": "LUTS.CA", "tradingview": "EGX:LUTS", "egid": "LUTS", "borsa": "LUTS"}
+  },
+  "borsa_base_url": "",
+  "investor_egx_universe_path": "",
+  "investor_egx_sqlite_path": "",
+  "freshness": {
+    "live_seconds": 15,
+    "fresh_seconds": 120,
+    "delayed_seconds": 1200
+  }
+}
