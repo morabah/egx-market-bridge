@@ -10,6 +10,7 @@ from egxbridge.analysis.common.models import utc_now, content_hash, AnalysisProv
 from egxbridge.analysis.common.packaging import write_json, write_text
 from egxbridge.analysis.common.persistence import AnalysisStore
 from egxbridge.analysis.funnel.models import CRITICAL_KEYS
+from egxbridge.analysis.funnel.schema import finite_number, valuation_date
 from egxbridge.analysis.funnel.state import workspace_dir, load_project, mark_stage_complete, save_project
 from egxbridge.analysis.funnel.completion import (
     valuation_status_for_import,
@@ -20,14 +21,19 @@ from egxbridge.analysis.funnel.completion import (
     FULL_AUTOMATED_RESULT_ID,
 )
 
+VALUATION_FIELDS = (
+    "central_fv", "highest_credible_bull_fv", "robust_fv_range", "valuation_date",
+    "economic_terminal_value", "expected_horizon_market_price", "expected_return_spread",
+)
+
 
 def _optional_extract_keys(text: str) -> dict[str, str]:
     """Low-confidence optional extraction — never discard original text."""
     found: dict[str, str] = {}
     for key in CRITICAL_KEYS:
         # patterns like **Fair Value**: 12.3 or Fair Value = 12.3
-        pat = rf"{re.escape(key)}\s*[:=]\s*([^\n\|]+)"
-        m = re.search(pat, text, flags=re.I)
+        pat = rf"^\s*(?:[-*] )?(?:\*\*)?{re.escape(key)}(?:\*\*)?\s*[:=]\s*([^\n\|]+)"
+        m = re.search(pat, text, flags=re.I | re.M)
         if m:
             found[key] = m.group(1).strip()[:200]
     return found
@@ -81,7 +87,8 @@ def import_funnel_result(
     source_cutoff = (envelope or {}).get("declared_research_cutoff") or (envelope or {}).get("source_cutoff")
     provenance = {"classification_source": "FUNNEL_LLM", "analysis_imported_at": imported_at,
                   "analysis_started_at": (envelope or {}).get("analysis_started_at"),
-                  "source_cutoff": source_cutoff, "market_data_cutoff": (envelope or {}).get("market_data_cutoff"),
+                  "source_cutoff": source_cutoff, "declared_research_cutoff": source_cutoff,
+                  "market_data_cutoff": (envelope or {}).get("market_data_cutoff"),
                   "funnel_version": project.funnel_version, "content_hash": h,
                   "decision_kind": "IMPORTED_LLM_DECISION"}
     previous_provenance = project.structured_provenance
@@ -91,6 +98,65 @@ def import_funnel_result(
     field_provenance.update({key: provenance for key in fields})
     project.structured_fields.update(fields)
     project.structured_provenance = {**provenance, "field_provenance": field_provenance}
+
+    # One valuation owner: normalized v2.8 fields also feed legacy persistence readers.
+    is_v28 = project.funnel_version.rsplit("_v", 1)[-1] == "2.8"
+    valuation = {k: project.structured_fields[k] for k in VALUATION_FIELDS
+                 if is_v28 and k in project.structured_fields}
+    central_fv = finite_number(valuation.get("central_fv"))
+    structured_date = valuation_date(valuation.get("valuation_date"))
+    persisted = dict(extracted)
+    diagnostics = []
+    for legacy_key, structured_value in (
+        ("Fair Value", central_fv), ("Blended Fair Value", central_fv),
+        ("Valuation date", structured_date),
+    ):
+        if structured_value is None:
+            continue
+        legacy_raw = extracted.get(legacy_key)
+        legacy_value = finite_number(legacy_raw) if legacy_key != "Valuation date" else valuation_date(legacy_raw)
+        if legacy_raw is not None and legacy_value != structured_value:
+            diagnostics.append({"code": "VALUATION_SOURCE_CONFLICT", "field": legacy_key,
+                "structured_value": structured_value, "legacy_text_value": legacy_value if legacy_value is not None else legacy_raw,
+                "legacy_text_raw": legacy_raw, "chosen_source": "STRUCTURED_FUNNEL_V28", "content_hash": h})
+        # Keep the old Blended FV slot synchronized only when it already exists.
+        if legacy_key != "Blended Fair Value" or legacy_key in extracted or (store and store.get_key_value(ticker, legacy_key) is not None):
+            persisted[legacy_key] = str(structured_value)
+    if is_v28 and "Valuation date" in persisted and not valuation_date(persisted["Valuation date"]):
+        persisted.pop("Valuation date")
+    new_valuation = any(k in fields for k in VALUATION_FIELDS) if is_v28 else False
+    legacy_fv = extracted.get("Fair Value") or extracted.get("Blended Fair Value")
+    chosen_fv = str(central_fv) if central_fv is not None else legacy_fv
+    if chosen_fv is None and store:
+        chosen_fv = store.get_key_value(ticker, "Fair Value") or store.get_key_value(ticker, "Blended Fair Value")
+    chosen_date = persisted.get("Valuation date") or project.last_valuation_date
+    if is_v28:
+        chosen_date = valuation_date(chosen_date)
+    if new_valuation or legacy_fv is not None:
+        if chosen_date:
+            project.last_valuation_date = chosen_date
+        if chosen_fv is not None:
+            project.valuation_status = valuation_status_for_import(
+                fair_value=chosen_fv, valuation_date=chosen_date, current=project.valuation_status)
+    elif project.last_valuation_date is None and project.valuation_status == "UPDATED":
+        project.valuation_status = "NOT_ESTABLISHED"
+
+    hist_path = base / "results" / "valuation_history.json"
+    hist = json.loads(hist_path.read_text(encoding="utf-8")) if hist_path.exists() else []
+    if not isinstance(hist, list):
+        raise ValueError("Invalid valuation history; existing file preserved")
+    if new_valuation or legacy_fv is not None:
+        hist.append({
+            "recorded_at": imported_at, "funnel_version": project.funnel_version,
+            **valuation, "valuation_date": chosen_date,
+            "fair_value": chosen_fv,  # compatible with historical readers; never horizon price
+            "source_kind": "STRUCTURED_FUNNEL_V28" if central_fv is not None or (new_valuation and legacy_fv is None) else "LEGACY_TEXT_EXTRACTION",
+            "stage": stage, "content_hash": h, "analysis_imported_at": imported_at,
+            "declared_research_cutoff": source_cutoff, "market_data_cutoff": provenance["market_data_cutoff"],
+            "field_provenance": {k: field_provenance[k] for k in valuation if k in field_provenance},
+            "legacy_text_extraction": extracted, "diagnostics": diagnostics,
+        })
+
     classification_linkage = "NO_CANONICAL_SIGNAL_SUPPLIED"
     cid = (envelope or {}).get("canonical_signal_id")
     if store and cid:
@@ -106,6 +172,7 @@ def import_funnel_result(
     meta = {
         "extracted_keys_optional": extracted,
         "structured_fields": fields, "structured_provenance": provenance, "schema_issues": schema_issues,
+        "valuation_diagnostics": diagnostics,
         "funnel_version": project.funnel_version, "run_started_at": project.run_started_at,
         "extraction_confidence": "LOW" if extracted else "NONE",
         **{k: tags[k] for k in ("analysis_scope", "run_mode", "result_type") if k in tags},
@@ -120,12 +187,17 @@ def import_funnel_result(
 
     if store:
         store.insert_stage_result(ticker, str(stage), content, source_file=source_file, meta=meta)
-        for k, v in extracted.items():
+        for k, v in persisted.items():
+            structured_key = {"Fair Value": "central_fv", "Blended Fair Value": "central_fv", "Valuation date": "valuation_date"}.get(k)
+            if structured_key in valuation and structured_key not in fields and store.get_key_value(ticker, k) == v:
+                continue  # an unrelated stage must not re-date an unchanged compatibility value
             store.set_key_value(
                 ticker, k, v,
                 as_of=utc_now(),
                 source_stage=str(stage),
-                reason="optional extraction from imported Funnel text",
+                reason="authoritative structured Funnel v2.8 value" if k in {"Fair Value", "Blended Fair Value", "Valuation date"} and
+                    ((k == "Valuation date" and structured_date is not None) or (k != "Valuation date" and central_fv is not None))
+                    else "optional extraction from imported Funnel text",
                 source=source_file,
             )
         prov = AnalysisProvenance(
@@ -142,30 +214,6 @@ def import_funnel_result(
         )
         store.record_import(prov.to_dict(), content)
 
-    # Append valuation history if Fair Value present
-    hist_path = base / "results" / "valuation_history.json"
-    hist = []
-    if hist_path.exists():
-        try:
-            hist = json.loads(hist_path.read_text(encoding="utf-8"))
-        except Exception:
-            hist = []
-    if "Fair Value" in extracted or "Blended Fair Value" in extracted:
-        hist.append({
-            "recorded_at": utc_now(),
-            "fair_value": extracted.get("Fair Value") or extracted.get("Blended Fair Value"),
-            "stage": stage,
-            "content_hash": h,
-        })
-        if extracted.get("Valuation date"):
-            project.last_valuation_date = extracted["Valuation date"]
-        project.valuation_status = valuation_status_for_import(
-            fair_value=extracted.get("Fair Value") or extracted.get("Blended Fair Value"),
-            valuation_date=project.last_valuation_date or extracted.get("Valuation date"),
-            current=project.valuation_status,
-        )
-    elif project.last_valuation_date is None and project.valuation_status == "UPDATED":
-        project.valuation_status = "NOT_ESTABLISHED"
     write_json(hist_path, hist)
 
     sync_completion_fields(project, store=store, workspace_root=workspace_root)
@@ -176,6 +224,7 @@ def import_funnel_result(
         "imported_at": utc_now(),
         "content_hash": h,
         "optional_extracted_keys": extracted,
+        "valuation_diagnostics": diagnostics,
         "structured_fields": fields, "schema_issues": schema_issues, "classification_linkage": classification_linkage,
         "completed_stages": list(project.completed_stages),
         "funnel_completion_status": project.funnel_completion_status,
@@ -205,6 +254,7 @@ def import_funnel_result(
         "saved_path": str(out_file),
         "original_preserved": True,
         "optional_extracted_keys": extracted,
+        "valuation_diagnostics": diagnostics,
         "structured_fields": fields, "schema_issues": schema_issues, "classification_linkage": classification_linkage,
         "project": load_project(ticker, workspace_root).to_dict() if load_project(ticker, workspace_root) else None,
     }

@@ -1,4 +1,4 @@
-# EGX Market Bridge v0.7.0 — Funnel v2.8 and Forward Validation Lab
+# EGX Market Bridge v0.7.1 — Funnel v2.8 and Forward Validation Lab
 
 A **read-only** Egyptian Exchange market-data aggregation layer plus **ChatGPT handoff** analysis workflows (no paid LLM API required):
 
@@ -6,7 +6,18 @@ A **read-only** Egyptian Exchange market-data aggregation layer plus **ChatGPT h
 
 It does **not** place orders, log into Thndr, scrape authenticated broker pages, store broker passwords, or bypass provider licensing.
 
-> **Open-source software ≠ free exchange data.** Upstream providers have their own terms. Delayed/public data is for research, not execution timing, unless a licensed live feed is configured and verified.
+> **Source-available repository; the owner has not selected a software license.** Upstream providers have their own terms. Delayed/public data is for research, not execution timing, unless a licensed live feed is configured and verified.
+
+## What changed in v0.7.1
+
+Application/workflow **0.7.1** · Funnel **2.8** · Scanner **0.5.1 / HEURISTIC_UNCALIBRATED** · Data layer **0.3.1** · AI mode **CHATGPT_HANDOFF**.
+
+- Corrected configured cash-session boundaries and the completed-session cutoff.
+- Valid normalized Funnel v2.8 valuation fields now feed valuation history, date/status and existing valuation readers. Structured/prose disagreements remain visible as `VALUATION_SOURCE_CONFLICT`.
+- Archived the unchanged v2.7 Stage-12 audit and added a separate v2.8-compatible audit. See [asset ownership](prompts/README.md).
+- Added offline fixture CI for Python 3.11/3.12 and `python scripts/acceptance_v071.py`.
+
+See [operational integrity](docs/OPERATIONAL_INTEGRITY.md) for precedence, provenance, clock bands and acceptance outputs. The evidence/LLM/user responsibilities and forward-validation architecture remain unchanged.
 
 ## What changed in v0.7.0
 

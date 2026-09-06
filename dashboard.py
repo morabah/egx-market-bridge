@@ -273,6 +273,9 @@ elif page == "Analysis Workflows":
             dest.write_bytes(uploaded.getvalue())
             imp = funnel_reg.import_result(fticker, dest)
             st.success(f"Imported stage {imp.get('stage_id')} — original preserved")
+            if imp.get("valuation_diagnostics"):
+                st.warning("VALUATION_SOURCE_CONFLICT: the structured valuation is authoritative. Conflicting prose is retained for review.")
+                st.json(imp["valuation_diagnostics"])
             st.json({k: imp[k] for k in ("content_hash", "optional_extracted_keys", "saved_path") if k in imp})
 
         with st.expander("Funnel history and saved values"):

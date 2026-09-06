@@ -260,7 +260,10 @@ def import_funnel_result(*, funnel_registry, ticker: str, source: Path | str) ->
         res = funnel_registry.import_result(t, source)
     except Exception as e:
         return _fail(_user_exc(e, f"Could not import Funnel result for {t}."))
-    return _ok(f"Imported Funnel result for {t}. Original preserved.", result=res)
+    message = f"Imported Funnel result for {t}. Original preserved."
+    if res.get("valuation_diagnostics"):
+        message += " VALUATION_SOURCE_CONFLICT: structured valuation retained; conflicting prose is saved in valuation history."
+    return _ok(message, result=res)
 
 
 def refresh_intraday(*, explorer_payload: dict[str, Any] | None, root: Path | None = None) -> dict[str, Any]:

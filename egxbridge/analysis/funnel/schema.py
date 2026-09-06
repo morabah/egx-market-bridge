@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import date
 from typing import Any
 
 FUNNEL_SCHEMA_VERSION = "2.8.0"
@@ -51,6 +52,16 @@ def finite_number(value: Any) -> float | None:
         return None
 
 
+def valuation_date(value: Any) -> str | None:
+    """A supplied valuation date must be a real ISO calendar date, never inferred."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return None
+    try:
+        return date.fromisoformat(value.strip()).isoformat()
+    except ValueError:
+        return None
+
+
 def normalize_fields(data: dict[str, Any], *, later: bool = False) -> tuple[dict, list[str]]:
     """Partial records are valid. Invalid fields stay in raw import, not report groups."""
     fields, issues = {}, []
@@ -72,6 +83,12 @@ def normalize_fields(data: dict[str, Any], *, later: bool = False) -> tuple[dict
                 issues.append(f"{key}: expected finite number")
             else:
                 fields[key] = n
+        elif key == "valuation_date":
+            normalized_date = valuation_date(value)
+            if normalized_date is None:
+                issues.append("valuation_date: expected a valid YYYY-MM-DD date")
+            else:
+                fields[key] = normalized_date
         elif key == "fresh_capital_pillars":
             if not isinstance(value, dict):
                 issues.append(f"{key}: expected an object with four named pillars")
@@ -102,17 +119,20 @@ def extract_summary(content: str, envelope: dict | None) -> tuple[dict, list[str
     for line in content.splitlines():
         cleaned = line.strip().strip("|").replace("**", "").strip()
         match = re.match(r"([^:=|]+)\s*[:=]\s*(.+)", cleaned)
-        if match:
+        # JSON properties are handled by the envelope parser, not as prose values.
+        if match and not match[1].strip().startswith('"'):
             raw[match[1].strip()] = match[2].strip().strip("|").strip()
-    issues = []
+    fields, issues = normalize_fields(raw)
     if envelope:
         section = envelope.get("final_decision_summary") or envelope.get("structured_fields") or envelope
         if isinstance(section, dict):
-            raw.update(section)
+            # Normalize separately so aliases and invalid values cannot reverse precedence.
+            structured, structured_issues = normalize_fields(section)
+            fields.update(structured)
+            issues.extend(structured_issues)
         else:
             issues.append("final_decision_summary: expected an object")
-    fields, field_issues = normalize_fields(raw)
-    return fields, issues + field_issues
+    return fields, issues
 
 
 def result_schema() -> dict:

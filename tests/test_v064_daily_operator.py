@@ -108,17 +108,17 @@ def test_default_page_is_daily_operator():
 
 def test_version_labels_are_not_ambiguous():
     lab = version_labels()
-    assert lab["application_version"] == APP_VERSION == "0.7.0"
+    assert lab["application_version"] == APP_VERSION == "0.7.1"
     assert lab["market_data_schema_version"] == DATA_LAYER_VERSION == "0.3.1"
     assert lab["scoring_version"] == SCORING_VERSION == "0.5.1"
-    assert lab["workflow_version"] == WORKFLOW_VERSION == "0.7.0"
+    assert lab["workflow_version"] == WORKFLOW_VERSION == "0.7.1"
     assert lab["score_kind"] == SCORE_KIND == "HEURISTIC_UNCALIBRATED"
     caption = version_caption(lab)
-    assert "Application: 0.7.0" in caption
+    assert "Application: 0.7.1" in caption
     assert "Market Data Schema: 0.3.1" in caption
     assert "Scoring: 0.5.1" in caption
     assert "Version:" not in caption
-    assert lab["title"] == "EGX Market Bridge v0.7.0"
+    assert lab["title"] == "EGX Market Bridge v0.7.1"
 
 
 def test_next_action_no_market_data():
@@ -335,7 +335,7 @@ def test_candidate_preview_does_not_imply_probability():
 
 def test_gather_empty_root_next_action_is_refresh(tmp_path: Path):
     snap = gather_operator_snapshot(root=tmp_path, session_meta=WEEKEND_META)
-    assert snap["versions"]["application_version"] == "0.7.0"
+    assert snap["versions"]["application_version"] == "0.7.1"
     assert snap["versions"]["market_data_schema_version"] == "0.3.1"
     assert snap["next_action"]["code"] == ACTION_REFRESH_MARKET_DATA
     assert snap["intraday"]["status"] == "NOT_LIVE"

@@ -182,7 +182,11 @@ def compute_outcomes(
 
 
 def completed_through(at: datetime | None = None) -> str:
-    cairo = (at or datetime.now(timezone.utc)).astimezone(CAIRO)
+    """Calendar cutoff for observed bars; today's bar is eligible from cash close.
+
+    This does not assert that a session exists on a weekend or unknown holiday.
+    """
+    cairo = (parse_dt(at) or datetime.now(timezone.utc)).astimezone(CAIRO)
     day = cairo.date()
     if (cairo.hour, cairo.minute) < TRADING_AT_LAST_END:
         day -= timedelta(days=1)

@@ -9,9 +9,9 @@ CAIRO = ZoneInfo("Africa/Cairo")
 
 # Documented EGX cash-market bands (Africa/Cairo). Configurable, not an exchange feed.
 PRE_OPEN_END = (10, 0)
-CONTINUOUS_END = (14, 20)
-CLOSING_AUCTION_END = (14, 30)
-TRADING_AT_LAST_END = (14, 45)
+CONTINUOUS_END = (14, 15)
+CLOSING_AUCTION_END = (14, 25)
+TRADING_AT_LAST_END = (14, 30)
 
 
 def parse_dt(value: str | datetime | None) -> datetime | None:
@@ -48,7 +48,7 @@ def now_utc_cairo(at: datetime | None = None) -> dict[str, str]:
 
 def classify_session_phase(at: datetime | str | None = None) -> str:
     """Map a timestamp onto EGX session bands. Weekends → POST_CLOSE."""
-    dt = parse_dt(at) if not isinstance(at, datetime) else at
+    dt = parse_dt(at)
     if dt is None:
         dt = datetime.now(timezone.utc)
     cairo = dt.astimezone(CAIRO)
@@ -76,10 +76,10 @@ def session_context(at: datetime | None = None) -> dict[str, Any]:
         "target_session_status": "UNKNOWN",
         "note": "No official EGX calendar locally; do not guess holidays. Session phase is a clock-band label, not live execution.",
         "egx_bands_cairo": {
-            "PRE_OPEN": "until 10:00",
-            "CONTINUOUS_TRADING": "10:00–14:20",
-            "CLOSING_AUCTION": "14:20–14:30",
-            "TRADING_AT_LAST": "14:30–14:45",
-            "POST_CLOSE": "after 14:45 or weekend",
+            "PRE_OPEN": "before 10:00",
+            "CONTINUOUS_TRADING": "10:00–14:15",
+            "CLOSING_AUCTION": "14:15–14:25",
+            "TRADING_AT_LAST": "14:25–14:30",
+            "POST_CLOSE": "14:30 onward or Friday/Saturday",
         },
     }

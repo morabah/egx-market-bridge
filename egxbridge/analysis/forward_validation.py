@@ -13,6 +13,7 @@ from typing import Any
 import json
 import math
 
+from egxbridge import __version__ as APP_VERSION
 from egxbridge.analysis import SCORING_VERSION
 from egxbridge.analysis.common.models import utc_now, content_hash
 from egxbridge.analysis.funnel.schema import normalize_fields, finite_number, JUDGMENT_FIELDS, MISSING_VALUES
@@ -77,7 +78,7 @@ def start_validation(store, *, at: str | None = None, config: dict | None = None
            or not isinstance(v, (int, float)) or finite_number(v) is None or v < 0 for k, v in costs.items()):
         raise ValueError("Friction components must be known nonnegative finite percentage-point costs")
     run = {"FORWARD_VALIDATION_START": started, "status": "ACTIVE", "config": cfg,
-           "application_version": "0.7.0", "scoring_version": SCORING_VERSION,
+           "application_version": APP_VERSION, "scoring_version": SCORING_VERSION,
            "default_sample_kind": "CONTEMPORANEOUS", "synthetic": store.environment != "PRODUCTION"}
     store.append_validation_record("forward_test_runs", "forward-v070", run)
     rules = {

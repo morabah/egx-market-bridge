@@ -1,4 +1,4 @@
-"""Import-verified Funnel completion and DELTA eligibility (v0.4.3)."""
+"""Import-verified Funnel completion and DELTA eligibility."""
 from __future__ import annotations
 
 from pathlib import Path

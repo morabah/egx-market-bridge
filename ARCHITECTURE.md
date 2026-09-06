@@ -1,4 +1,4 @@
-# Architecture — EGX Market Bridge v0.7.0
+# Architecture — EGX Market Bridge v0.7.1
 
 ```text
                      Provider Manager
@@ -62,3 +62,5 @@ BRIDGE = FACTS + SNAPSHOTS + VALIDATION. SCHEDULE LLM = TACTICAL / NEWS / MARKET
 Frozen source rows, append-only LLM classifications, mutable maturity outcomes and later Weekly event reviews are separate records. Legacy outcomes cannot become a new T0 sample, nor can old Funnel stages prove completion of an archived/new-version run. No scoring implementation or rule optimizer was added.
 
 See [Forward validation contract](docs/FORWARD_VALIDATION.md) for table ownership, formulas, chronology, cohorts, rule/change controls and limitations.
+
+v0.7.1 keeps these owners. `schedule.session` supplies the configured normal clock bands to outcome tracking; the lower-level freshness check uses the same close boundary. The existing Funnel importer maps validated v2.8 valuation fields into history and legacy valuation readers, retaining field provenance and explicit source conflicts. No valuation or final-decision calculation moves into the app. See [operational integrity](docs/OPERATIONAL_INTEGRITY.md).

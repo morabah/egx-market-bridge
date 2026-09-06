@@ -1,6 +1,6 @@
-# EGX Market Bridge 0.7.0 — forward-validation contract
+# EGX Market Bridge v0.7.1 — forward-validation contract
 
-Application **0.7.0**, Funnel prompt **2.8**, scanner scoring **0.5.1 / HEURISTIC_UNCALIBRATED**, handoff schema **1.1**, market-data schema **0.3.1**, AI mode **CHATGPT_HANDOFF** are separate versions.
+Application/workflow **0.7.1**, Funnel prompt **2.8**, scanner scoring **0.5.1 / HEURISTIC_UNCALIBRATED**, handoff schema **1.1**, market-data schema **0.3.1**, AI mode **CHATGPT_HANDOFF** are separate versions.
 
 The app prepares evidence and tracks results. It does not make the final investment decision.
 
@@ -65,6 +65,8 @@ Horizons are **1, 2, 5, 10 and 20 observed completed trading sessions**, with op
 
 Daily windows exclude sessions already underway when T0 evidence was frozen. A `through-session` cutoff cannot include future or unfinished daily sessions. The baseline price/timestamp and its reference-price integrity remain visible. These are observation returns, not a claimed executable fill or total-shareholder-return series.
 
+Normal cash-session clock bands in Africa/Cairo: PRE_OPEN before 10:00; CONTINUOUS 10:00–14:15; CLOSING AUCTION 14:15–14:25; TRADING AT LAST 14:25–14:30; POST CLOSE from 14:30. These are configured normal clock bands, not a live exchange calendar/feed. The current day's observed bar may be considered completed from 14:30; before that, `completed_through()` excludes it. The app does not guess holidays.
+
 - Gross return (%) = `(future close / baseline - 1) * 100`.
 - MFE (%) = maximum future high relative to baseline; MAE (%) = minimum future low relative to baseline. Both require the complete horizon and reliable high/low; closes are not substituted for missing extremes.
 - Discontinuity warnings are evaluated per horizon. Raw returns remain visible, while unreliable horizons do not enter empirical summary denominators.
@@ -97,6 +99,8 @@ The exact user-supplied root `EGX_STOCK_ANALYSIS_FUNNEL_v2.8.md` is the current 
 
 Structured fields and provenance are kept in project state for subsequent deltas and in immutable classification records for validation. Raw response text is always retained. Partial fields or claimed metadata do not establish complete status; existing verified-stage/full-tag safeguards remain. Direct DELTA_ONLY handoff also checks baseline eligibility. Version-mismatched imports are retained outside verified stage files.
 
+The v0.7.1 [valuation persistence contract](OPERATIONAL_INTEGRITY.md) makes validated structured Central FV authoritative in history and existing readers. Expected Horizon Market Price remains separate. Audit assets are explicitly [versioned](../prompts/README.md); the archived v2.7 audit is not a current v2.8 workflow requirement.
+
 ## Commands and acceptance
 
 The dashboard is the primary workflow. Optional commands:
@@ -108,6 +112,9 @@ python -m egxbridge.analysis.forward_validation --summary
 python -m egxbridge.analysis.forward_validation --expectations --false-negatives
 python -m egxbridge.analysis.forward_validation --weekly-package
 python scripts/acceptance_v070.py
+python scripts/acceptance_v071.py
 ```
 
 The acceptance script runs the full configured pytest suite and generates `output/acceptance/v070/forward_validation_acceptance.md` plus JSON, schema, CSV and rule/proposal examples. All examples are synthetic and never become production evidence. The repository's pytest configuration excludes its external-network integration test by default.
+
+The v0.7.1 script additionally checks operational integrity and writes `output/acceptance/v071/operational_integrity_acceptance.md` and its JSON reports. CI runs it after the configured test suite, without exchange, broker or LLM credentials.

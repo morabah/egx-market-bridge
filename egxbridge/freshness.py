@@ -5,13 +5,11 @@ from datetime import datetime, timezone, time as dtime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 
-# EGX regular session (Sun–Thu). Window is inclusive of typical open/close buffer.
-# Official cash session is commonly ~10:00–14:30 Cairo; we use 10:00–14:45.
+# Configured normal cash-market clock bands; not a live exchange calendar/feed.
 EGX_SESSION_OPEN = dtime(10, 0)
-EGX_SESSION_CLOSE = dtime(14, 45)
+EGX_SESSION_CLOSE = dtime(14, 30)
 # Egypt weekend: Friday + Saturday
 EGX_WEEKEND_WEEKDAYS = {4, 5}  # Fri=4, Sat=5
 
@@ -72,7 +70,7 @@ def egx_session_open_at(when: datetime | None = None) -> bool:
     if local.weekday() in EGX_WEEKEND_WEEKDAYS:
         return False
     t = local.time()
-    return EGX_SESSION_OPEN <= t <= EGX_SESSION_CLOSE
+    return EGX_SESSION_OPEN <= t < EGX_SESSION_CLOSE
 
 
 def classify_freshness(

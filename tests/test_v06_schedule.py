@@ -309,8 +309,8 @@ def test_import_preserves_raw_and_optional_envelope(tmp_path: Path):
 def test_session_phase_bands():
     assert classify_session_phase("2026-09-03T07:00:00+03:00") == "PRE_OPEN"
     assert classify_session_phase("2026-09-03T11:00:00+03:00") == "CONTINUOUS_TRADING"
-    assert classify_session_phase("2026-09-03T14:25:00+03:00") == "CLOSING_AUCTION"
-    assert classify_session_phase("2026-09-03T14:40:00+03:00") == "TRADING_AT_LAST"
+    assert classify_session_phase("2026-09-03T14:25:00+03:00") == "TRADING_AT_LAST"
+    assert classify_session_phase("2026-09-03T14:40:00+03:00") == "POST_CLOSE"
     assert classify_session_phase("2026-09-03T16:00:00+03:00") == "POST_CLOSE"
     assert classify_session_phase("2026-09-05T11:00:00+03:00") == "POST_CLOSE"  # Saturday
 
