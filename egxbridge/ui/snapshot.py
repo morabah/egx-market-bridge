@@ -12,6 +12,7 @@ from egxbridge.analysis.schedule.session import session_context, parse_dt, CAIRO
 from egxbridge.analysis.schedule.types import ANALYSIS_TYPES
 from egxbridge.analysis.schedule.decisions import suggested_funnel_action
 from egxbridge.analysis.schedule.metrics import observation_counts, calibration_status_for_n
+from egxbridge.semantics import previous_egx_session_date
 from egxbridge.ui.versions import version_labels
 from egxbridge.ui.workflow_state import (
     freshness_state, freshness_note, explorer_status, recommended_jobs, intraday_card_state,
@@ -44,12 +45,6 @@ def _existing(path: str | Path | None) -> Path | None:
     return p
 
 
-def _candidate_n(payload: dict[str, Any]) -> int:
-    return len(payload.get("candidates") or []) or int(
-        payload.get("handoff_candidate_count") or (payload.get("counts") or {}).get("HANDOFF_CANDIDATES") or 0
-    )
-
-
 def _package_from_dir(pkg: Path | None) -> dict[str, Any]:
     if not pkg or not pkg.exists():
         return {}
@@ -59,50 +54,30 @@ def _package_from_dir(pkg: Path | None) -> dict[str, Any]:
 
 
 def resolve_explorer_package(root: Path | None = None) -> dict[str, Any]:
-    """Resolve the latest *usable* Explorer package.
-
-    Ignore last_run.json when its package_dir is a vanished pytest temp path.
-    If the dashboard alias only has a tiny leftover shortlist, prefer the
-    accepted broad-universe package when present.
-    """
+    """Select the newest production snapshot, including legitimate empty scans."""
     root = root or HERE
     last_raw = _load_json(root / "workspace" / "explorer" / "last_run.json")
-    last = last_raw if _existing(last_raw.get("package_dir")) else {}
-    pkg = _existing(last.get("package_dir"))
     alias = root / "output" / "explorer_handoff"
-    v06 = root / "output" / "acceptance" / "v06" / "explorer_handoff"
-    if pkg is None:
-        if (alias / "explorer_handoff.json").exists():
-            pkg = alias
-        elif alias.exists():
-            kids = sorted([p for p in alias.iterdir() if p.is_dir()], reverse=True)
-            for k in kids:
-                if (k / "explorer_handoff.json").exists() or (k / "candidate_metrics.csv").exists():
-                    pkg = k
-                    break
-        payload_alias = _package_from_dir(pkg)
-        if _candidate_n(payload_alias) < 10 and (v06 / "explorer_handoff.json").exists():
-            if _candidate_n(_package_from_dir(v06)) >= 10:
-                pkg = v06
-                last = {}
-    payload = _package_from_dir(pkg)
+    paths = [alias, *(p for p in alias.iterdir() if p.is_dir())] if alias.exists() else []
+    pointed = _existing(last_raw.get("package_dir"))
+    if pointed and last_raw.get("environment", PRODUCTION) == PRODUCTION:
+        paths.append(pointed)
+    options = []
+    for path in dict.fromkeys(paths):
+        candidate = _package_from_dir(path)
+        if candidate and candidate.get("environment", PRODUCTION) == PRODUCTION:
+            created = parse_dt(candidate.get("generated_at")) or datetime.min.replace(tzinfo=timezone.utc)
+            options.append((created, path, candidate))
+    _, pkg, payload = max(options, key=lambda item: (item[0], str(item[1])), default=(None, None, {}))
+    last = last_raw if pkg and str(pkg) == str(last_raw.get("package_dir")) else {}
     counts = dict(payload.get("counts") or {})
-    if last.get("counts") and pkg and str(pkg) == str(last.get("package_dir")):
-        counts = {**counts, **(last.get("counts") or {})}
     coverage = payload.get("coverage") or {}
-    if last.get("coverage") and pkg and str(pkg) == str(last.get("package_dir")):
-        coverage = last.get("coverage") or coverage
     man = _load_json((pkg / "manifest.json") if pkg else Path()) or {}
-    if last.get("manifest") and pkg and str(pkg) == str(last.get("package_dir")):
-        man = {**(last.get("manifest") or {}), **man}
-    uni = _load_json((pkg / "universe_coverage.json") if pkg else Path()) or {}
-    if uni:
-        counts = {**uni, **counts}
     zip_path = last.get("zip_path")
     if zip_path and not Path(zip_path).exists():
         zip_path = None
     return {
-        "last_run": last or last_raw,
+        "last_run": last,
         "package_dir": str(pkg) if pkg else None,
         "payload": payload,
         "counts": counts,
@@ -111,7 +86,7 @@ def resolve_explorer_package(root: Path | None = None) -> dict[str, Any]:
         "candidates": list(payload.get("candidates") or []),
         "zip_path": zip_path,
         "explorer_run_id": last.get("explorer_run_id") or payload.get("explorer_run_id") or man.get("explorer_run_id"),
-        "generated_at": man.get("generated_at") or payload.get("generated_at") or last.get("generated_at"),
+        "generated_at": payload.get("generated_at") or man.get("generated_at"),
         "latest_session": (
             payload.get("latest_completed_market_session")
             or counts.get("latest_completed_market_session")
@@ -120,6 +95,7 @@ def resolve_explorer_package(root: Path | None = None) -> dict[str, Any]:
         ),
         "scoring_version": man.get("scoring_version") or payload.get("scoring_version") or "0.5.1",
         "intraday_queried_tickers": list(payload.get("intraday_queried_tickers") or []),
+        "data_stamp": payload.get("data_stamp") or (_load_json(pkg / "DATA_STAMP.json") if pkg else {}),
     }
 
 
@@ -134,6 +110,13 @@ def resolve_schedule_package(root: Path | None = None) -> dict[str, Any]:
     combined = last.get("combined_zip")
     if combined and not Path(combined).exists():
         combined = None
+    if not combined and pkg:
+        parent = pkg.parent
+        dated = sorted(parent.glob("EGX_CHATGPT_HANDOFF_session-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if dated:
+            combined = str(dated[0])
+        elif (parent / "EGX_CHATGPT_HANDOFF.zip").exists():
+            combined = str(parent / "EGX_CHATGPT_HANDOFF.zip")
     return {
         "last_run": last,
         "package_dir": str(pkg) if pkg else None,
@@ -147,6 +130,7 @@ def resolve_schedule_package(root: Path | None = None) -> dict[str, Any]:
         "candidate_count": man.get("handoff_candidate_count"),
         "explorer_run_id": man.get("explorer_run_id"),
         "session_phase": man.get("session_phase"),
+        "data_stamp": man.get("data_stamp") or last.get("data_stamp"),
     }
 
 
@@ -239,6 +223,33 @@ def _plan_from_imports(imports: dict[str, dict[str, Any]], candidates: list[dict
     }
 
 
+def _price_session_from_db(db, sample: list[str] | None = None, *, as_of=None, package_session: str | None = None) -> dict[str, Any]:
+    """Reconcile every known equity, including those with no daily data."""
+    from egxbridge.universe import build_canonical_universe, _daily_stats
+    expected = previous_egx_session_date(as_of)
+    stats = []
+    if db is not None:
+        for symbol in sample if sample is not None else build_canonical_universe(db=db)["equity_symbols"]:
+            row = _daily_stats(db, symbol, as_of=as_of)
+            stats.append({"ticker": symbol, **row})
+    sessions = [r["latest_session"] for r in stats if r["latest_session"]]
+    stored = max(sessions) if sessions else package_session
+    stale = [r["ticker"] for r in stats if r["data_state"] == "STALE"]
+    missing = [r["ticker"] for r in stats if r["data_state"] == "MISSING"]
+    providers = sorted({r["provider"] for r in stats if r["count"]})
+    lagging = bool(stale or missing or not stored or stored < expected)
+    return {
+        "price_session": stored, "expected_session": expected, "daily_bars_lagging": lagging,
+        "daily_provider": ", ".join(providers) or None,
+        "daily_session_note": f"Expected {expected}: {len(stats) - len(stale) - len(missing)} current, {len(stale)} stale, {len(missing)} missing equities. Latest observed session: {stored or 'none'}.",
+        "daily_current_count": len(stats) - len(stale) - len(missing),
+        "daily_available_count": sum(r["count"] > 0 for r in stats),
+        "equity_count": len(stats),
+        "scanner_count": sum(r["count"] >= 20 for r in stats),
+        "daily_stale_tickers": stale, "daily_missing_tickers": missing,
+    }
+
+
 def _latest_session_from_handoff(handoff: dict[str, Any]) -> str | None:
     dates = []
     for s in handoff.get("symbols") or []:
@@ -249,8 +260,16 @@ def _latest_session_from_handoff(handoff: dict[str, Any]) -> str | None:
     return max(dates) if dates else None
 
 
-def _intraday_age_seconds(candidates: list[dict[str, Any]], now: datetime | None = None) -> float | None:
+def _intraday_age_seconds(candidates: list[dict[str, Any]], now: datetime | None = None, payload: dict[str, Any] | None = None) -> float | None:
     now = now or datetime.now(timezone.utc)
+    stamp = (payload or {}).get("data_stamp") or {}
+    last_bar = ((stamp.get("intraday") or {}).get("last_bar_utc"))
+    if last_bar:
+        dt = parse_dt(last_bar)
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds())
     stamps = []
     for c in candidates:
         intra = c.get("intraday") or {}
@@ -310,6 +329,15 @@ def gather_operator_snapshot(
         or schedule.get("latest_session")
         or _latest_session_from_handoff(handoff)
     )
+    as_of = now
+    if as_of is None and cdt is not None:
+        as_of = cdt
+    price_cov = _price_session_from_db(db, as_of=as_of, package_session=market_session)
+    if price_cov.get("price_session") and (
+        not market_session or str(price_cov["price_session"]) > str(market_session)[:10]
+    ):
+        # DB may already have a newer session than the last Explorer package.
+        market_session = price_cov["price_session"]
     payload = explorer.get("payload") or {}
     daily_n = int(
         counts.get("DAILY_DATA_AVAILABLE")
@@ -331,6 +359,10 @@ def gather_operator_snapshot(
         or payload.get("scanner_candidate_count")
         or 0
     )
+    if db is not None:
+        daily_n = price_cov.get("daily_available_count", daily_n)
+        equity_n = price_cov.get("equity_count", equity_n)
+        scanner_n = price_cov.get("scanner_count", scanner_n)
     data_usable = bool(handoff or scanner_n or daily_n or candidates)
     hs = handoff.get("status")
     if not handoff and not daily_n and not candidates:
@@ -360,7 +392,17 @@ def gather_operator_snapshot(
         }
         for r in provider_rows
     ]
-    latest_collection_at = handoff.get("generated_at")
+    from egxbridge.collect_universe import collection_report_for_db
+    collection_report = collection_report_for_db(db, as_of=now or cdt or datetime.now(timezone.utc))
+    latest_collection_at = collection_report.get("finished_at") or handoff.get("generated_at")
+    daily_refresh_checked = bool(
+        collection_report.get("status") in {"OK", "PARTIAL"}
+        and collection_report.get("scope") == "FULL_KNOWN_UNIVERSE"
+        and collection_report.get("expected_session") == price_cov.get("expected_session")
+        and parse_dt(collection_report.get("finished_at"))
+    )
+    if collection_report.get("status") in {"OK", "PARTIAL"}:
+        market_data_status = "READY" if collection_report.get("status") == "OK" else "READY_WITH_LIMITATIONS"
     if db is not None and not latest_collection_at:
         try:
             runs = db.fetch_runs(limit=1) or []
@@ -381,6 +423,21 @@ def gather_operator_snapshot(
         explorer_session=explorer.get("latest_session"),
         market_session=market_session,
         coverage=cov,
+    )
+    explorer_at = parse_dt(payload.get("generated_at"))
+    collection_at = parse_dt(collection_report.get("finished_at"))
+    if explorer_at and (
+        ((payload.get("data_stamp") or {}).get("daily_coverage") or {}).get("expected_session") != price_cov.get("expected_session")
+        or bool(collection_at and collection_at > explorer_at)
+    ):
+        exp_status = "STALE"
+    zip_stamp = schedule.get("data_stamp") or {}
+    packaged_at = parse_dt(zip_stamp.get("packaged_at_utc"))
+    intraday_at = parse_dt(payload.get("intraday_refreshed_at"))
+    package_outdated = bool(schedule.get("package_dir")) and (
+        (zip_stamp.get("daily_coverage") or {}).get("expected_session") != price_cov.get("expected_session")
+        or not packaged_at
+        or any(at and at > packaged_at for at in (explorer_at, collection_at, intraday_at))
     )
     rec_jobs = recommended_jobs(session_phase=sess.get("session_phase"), cairo_weekday=cairo_wd)
     imports = {}
@@ -420,7 +477,7 @@ def gather_operator_snapshot(
         pending = max(0, canon_n - complete_20 - not_eval)
     age = intraday_age_seconds
     if age is None:
-        age = _intraday_age_seconds(candidates, now=now)
+        age = _intraday_age_seconds(candidates, now=now, payload=payload)
     intra = intraday_card_state(session_phase=sess.get("session_phase"), age_seconds=age)
     outcomes_update_recommended = bool(pending and not weekend and sess.get("session_phase") not in {"PRE_OPEN"})
     # Weekend: pending is expected; do not push outcomes as next action.
@@ -437,10 +494,18 @@ def gather_operator_snapshot(
         "cairo_weekday": cairo_wd,
         "weekend": weekend,
         "latest_completed_market_session": market_session,
+        "price_session": price_cov.get("price_session") or market_session,
+        "expected_session": price_cov.get("expected_session"),
+        "daily_bars_lagging": bool(price_cov.get("daily_bars_lagging")),
+        "daily_provider": price_cov.get("daily_provider"),
+        "daily_session_note": price_cov.get("daily_session_note"),
         "handoff": handoff,
         "handoff_status": handoff.get("status"),
         "handoff_generated_at": handoff.get("generated_at"),
         "latest_collection_at": latest_collection_at,
+        "collection_report": collection_report,
+        "daily_refresh_checked": daily_refresh_checked,
+        "package_outdated": package_outdated,
         "data_usable": data_usable,
         "market_data_status": market_data_status,
         "provider_status": provider_status,
@@ -469,7 +534,7 @@ def gather_operator_snapshot(
         "candidate_count": len(candidates),
         "candidates": candidates,
         "schedule": schedule,
-        "schedules_prepared": bool(schedule.get("run_id") and schedule.get("package_dir")),
+        "schedules_prepared": bool(schedule.get("run_id") and schedule.get("package_dir") and not package_outdated),
         "next_session_jobs": list(NEXT_SESSION_JOBS),
         "imports": imports,
         "imported_n": imported_current,
@@ -488,6 +553,8 @@ def gather_operator_snapshot(
         "intraday": intra,
         "intraday_age_seconds": age,
         "intraday_max_age_seconds": INTRADAY_ACTIONABLE_MAX_AGE_SECONDS,
+        "data_stamp": payload.get("data_stamp") or explorer.get("data_stamp") or schedule.get("data_stamp"),
+        "intraday_stamp": ((payload.get("data_stamp") or explorer.get("data_stamp") or {}).get("intraday")),
         "canonical_n": canon_n,
         "outcomes_pending_n": pending,
         "outcomes_1s_n": complete_1,

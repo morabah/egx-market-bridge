@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 import time
+import threading
 from datetime import datetime
 
 from .base import (
@@ -53,18 +54,66 @@ class TradingViewProvider(MarketDataProvider):
         username: str = "",
         password: str = "",
         n_bars_default: int = 200,
+        load_backend: bool = True,
+        request_timeout: float = 30,
     ):
         super().__init__(enabled=enabled)
         self.symbol_resolver = symbol_resolver
         self.username = username
         self.password = password
         self.n_bars_default = n_bars_default
+        self.request_timeout = request_timeout
+        self._history_lock = threading.Lock()
         self.mode = "authenticated" if username else "anonymous"
         self._tv = None
         self._import_error: str | None = None
         self._backend: str | None = None
-        if enabled:
+        if enabled and load_backend:
             self._try_init()
+
+    def get_universe(self, *, timeout: float = 20) -> list[dict[str, Any]]:
+        """Read the public EGX catalog once; reject truncation instead of paginating forever."""
+        import requests
+
+        if not self.enabled:
+            raise ProviderError(self.name, "TradingView provider disabled")
+        response = requests.post(
+            "https://scanner.tradingview.com/egypt/scan",
+            json={
+                "filter": [{"left": "exchange", "operation": "equal", "right": "EGX"}],
+                "columns": ["name", "description", "type", "typespecs"],
+                "range": [0, 2000],
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") or []
+        if not rows or payload.get("totalCount") != len(rows):
+            raise ProviderError(self.name, "Incomplete EGX catalog response")
+        verified = utc_now_iso()
+        out = []
+        for row in rows:
+            name, description, kind, specs = row["d"]
+            if row.get("s") != f"EGX:{name}":
+                raise ProviderError(self.name, "Invalid EGX catalog identity")
+            specs = specs or []
+            security_type = (
+                "RIGHT" if kind == "right" or "right" in specs else
+                "WARRANT" if kind == "warrant" else
+                "EQUITY" if kind == "stock" else
+                "INDEX" if kind == "index" else
+                "ETF" if "etf" in specs else
+                "FUND" if kind == "fund" else "OTHER"
+            )
+            out.append({
+                "canonical": name, "name": description, "source": "tradingview",
+                "security_type": security_type, "aliases": {"tradingview": row["s"]},
+                "last_verified_at": verified,
+            })
+        if len({r["canonical"] for r in out}) != len(rows):
+            raise ProviderError(self.name, "Duplicate identities in EGX catalog")
+        return out
 
     def _try_init(self):
         self._ensure_ssl_certs()
@@ -105,6 +154,7 @@ class TradingViewProvider(MarketDataProvider):
     def capabilities(self) -> ProviderCapabilities:
         available = self._tv is not None
         return ProviderCapabilities(
+            market_universe=True,
             quote=available,
             daily_ohlcv=available,
             intraday_ohlcv=available,
@@ -174,6 +224,36 @@ class TradingViewProvider(MarketDataProvider):
         return mapped, "EGX"
 
     def _hist(self, symbol: str, interval: str, n_bars: int):
+        # tvDatafeed owns a mutable socket/session. Serialize it and close stalled
+        # streams even if heartbeat messages keep its socket read timeout alive.
+        with self._history_lock:
+            expired = threading.Event()
+
+            def stop_stream():
+                expired.set()
+                socket = getattr(self._tv, "ws", None)
+                if socket is not None:
+                    socket.close()
+
+            timer = threading.Timer(self.request_timeout, stop_stream)
+            timer.daemon = True
+            timer.start()
+            try:
+                result = self._read_history(symbol, interval, n_bars)
+                if expired.is_set():
+                    raise TimeoutError("TradingView history request timed out")
+                socket = getattr(self._tv, "ws", None)
+                if result is None and socket is not None and getattr(socket, "connected", True) is False:
+                    raise ConnectionError("TradingView connection closed before returning history")
+                return result
+            finally:
+                timer.cancel()
+                timer.join()
+                socket = getattr(self._tv, "ws", None)
+                if socket is not None:
+                    socket.close()
+
+    def _read_history(self, symbol: str, interval: str, n_bars: int):
         if self._tv is None:
             raise ProviderError(self.name, f"TradingView unavailable: {self._import_error}")
         sym, exchange = self._split_symbol(symbol)

@@ -1,9 +1,0 @@
-{
-  "egxbridge/scanner.py": "4270963dca532dbbfced74d57c3b61db8b36c4401912b7d14bb7bc218141fa32",
-  "egxbridge/analysis/explorer/calibration.py": "6cbbbdb8b7b3f1bc71ff07900d0db3e197a4b2031072ada83a31c8b9571cc5c9",
-  "egxbridge/analysis/explorer/prescreen.py": "6973c34fce2b005e5f0145d4f25c29f1cc451d971e9228069660f9b08a45b27a",
-  "egxbridge/analysis/schedule/identity.py": "683ad03f1ef48e08926cc83fb382c10c5eb910dc6f04deb805fa023b38ce9b10",
-  "prompts/EGX_STOCK_ANALYSIS_FUNNEL_v2.7.md": "24c6380531b6987ca11e494711b1c377a17dd28702d1784e863f5985292ba5d8",
-  "EGX_STOCK_ANALYSIS_FUNNEL_v2.8.md": "6125d593db7ddbd7ae4372e367835eb41d7c06f83e5134fde8ac6f8e86af0f45",
-  "EGX_STAGE12_AUDIT_FINAL_PACK_v1.1_v2.7_COMPATIBLE.md": "c54d91eec01474bf62d2571e97554d81dd9e8e2b3f253ee19ca9295773ecdcfc"
-}

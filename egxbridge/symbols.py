@@ -4,6 +4,84 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import json
+import re
+import unicodedata
+
+
+NAME_ALIASES_PATH = Path(__file__).resolve().parent / "data" / "egx_name_aliases.json"
+
+
+def normalize_issuer_name(value: str | None) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def load_name_aliases(path: Path | None = None) -> dict[str, list[str]]:
+    p = path or NAME_ALIASES_PATH
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, list[str]] = {}
+    if not isinstance(data, dict):
+        return {}
+    for ticker, names in data.items():
+        key = str(ticker).upper().strip()
+        rows = names if isinstance(names, list) else [names]
+        out[key] = [str(n) for n in rows if n]
+    return out
+
+
+def build_name_index(extra: dict[str, list[str]] | None = None) -> dict[str, str]:
+    index: dict[str, str] = {}
+    mapping = load_name_aliases()
+    if extra:
+        for k, names in extra.items():
+            mapping.setdefault(k.upper(), [])
+            mapping[k.upper()] = list(dict.fromkeys((mapping.get(k.upper()) or []) + list(names or [])))
+    for ticker, names in mapping.items():
+        t = ticker.upper().strip()
+        index[t] = t
+        index[normalize_issuer_name(t)] = t
+        for name in names:
+            n = normalize_issuer_name(name)
+            if n:
+                index[n] = t
+            compact = n.replace(" ", "")
+            if compact:
+                index[compact] = t
+    return index
+
+
+_NAME_INDEX = build_name_index()
+
+
+def canonicalize_any(value: str | None, *, extra_index: dict[str, str] | None = None) -> str:
+    """Resolve a ticker or issuer name to one canonical EGX ticker."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper()
+    if upper.endswith(".CA"):
+        upper = upper[:-3]
+    if upper.startswith("EGX:"):
+        upper = upper[4:]
+    index = dict(_NAME_INDEX)
+    if extra_index:
+        index.update(extra_index)
+    if upper in index:
+        return index[upper]
+    named = normalize_issuer_name(raw)
+    if named in index:
+        return index[named]
+    compact = named.replace(" ", "")
+    if compact in index:
+        return index[compact]
+    return upper
 
 
 DEFAULT_ALIASES: dict[str, dict[str, str]] = {
@@ -63,22 +141,23 @@ class SymbolRegistry:
         )
 
     def canonicalize(self, symbol: str) -> str:
-        s = symbol.upper().strip()
+        resolved = canonicalize_any(symbol)
+        if resolved in self._symbols:
+            return resolved
+        s = (resolved or str(symbol or "")).upper().strip()
         if s in self._symbols:
             return s
-        # Strip common suffixes
-        for suffix in (".CA", ".EG", ":MASR"):
-            pass
         if s.endswith(".CA"):
             return s[:-3]
         if s.startswith("EGX:"):
             return s[4:]
-        # Reverse lookup
         for rec in self._symbols.values():
             for a in rec.aliases.values():
                 if a.upper() == s or a.upper().endswith(":" + s) or a.upper() == s + ".CA":
                     return rec.canonical
-        return s
+            if rec.name and canonicalize_any(rec.name) == resolved:
+                return rec.canonical
+        return s or resolved
 
     def to_provider(self, symbol: str, provider: str) -> str:
         c = self.canonicalize(symbol)

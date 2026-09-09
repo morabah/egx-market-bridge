@@ -9,6 +9,14 @@ from egxbridge import __version__ as BRIDGE_VERSION
 from egxbridge.analysis import WORKFLOW_VERSION
 from egxbridge.analysis.common.ai_mode import AI_CHATGPT_HANDOFF, assert_handoff_only
 from egxbridge.analysis.common.models import HandoffManifest, utc_now
+from egxbridge.analysis.common.data_stamp import (
+    build_data_stamp,
+    copy_zip_sidecar,
+    dated_zip_name,
+    stamp_markdown,
+    write_package_stamp,
+    write_zip_sidecar,
+)
 from egxbridge.analysis.common.packaging import write_json, write_text, zip_directory, finalize_manifest, copy_file
 from egxbridge.analysis.common.provenance import bridge_market_evidence, write_market_bundle
 from egxbridge.analysis.common.persistence import AnalysisStore
@@ -49,7 +57,7 @@ def _funnel_request_md(project: FunnelProject, *, stage: str | None, evidence: d
         f"- LATEST COMPLETED MARKET SESSION: **{evidence.get('latest_completed_market_session') or 'N/A'}**",
         f"- SESSION DATE: **{evidence.get('session_date') or 'N/A'}**",
         f"- DATA CAPTURE CUTOFF: **{project.last_data_cutoff or 'see market_snapshot'}**",
-        f"- PACKAGE GENERATED AT: see manifest.generated_at (distinct from session_date)",
+        f"- PACKAGE GENERATED AT: **see DATA_STAMP.md (Cairo + UTC, distinct from session_date)**",
         f"- MARKET DATA QUALITY (research score): **{evidence.get('research_data_quality_score')}**",
         f"- MARKET DATA QUALITY (research grade): **{evidence.get('research_data_quality_grade')}**",
         f"- EXECUTION GRADE: **{evidence.get('execution_grade')}**",
@@ -239,6 +247,18 @@ def prepare_funnel_handoff(
     if mode == "DELTA_ONLY":
         stage_for_req = project.current_stage
 
+    package_generated_at = utc_now()
+    from egxbridge.universe import _daily_stats
+    daily_status = _daily_stats(db, project.ticker)
+    data_stamp = build_data_stamp(
+        packaged_at=package_generated_at,
+        session_close_date=evidence.get("latest_completed_market_session") or evidence.get("session_date"),
+        package_kind="FUNNEL_HANDOFF",
+        daily_rows=[{"ticker": project.ticker, **daily_status, "daily_bars": daily_status["count"], "data_captured_at": daily_status["captured_at"]}],
+        daily_provider=",".join(str(p) for p in (evidence.get("providers_used") or []) if p) or None,
+    )
+    write_package_stamp(pkg, data_stamp)
+
     write_text(pkg / "funnel_request.md", _funnel_request_md(
         project, stage=stage_for_req, evidence=evidence, previous_status=prev_status, mode=mode,
     ))
@@ -253,12 +273,8 @@ AI MODE: CHATGPT_HANDOFF (no paid API).
 
 Execution Grade = {evidence.get('execution_grade')} does not block long-term valuation.
 
-Clocks (do not conflate):
-- latest_completed_market_session / session_date = market session from normalized data
-- data_capture_cutoff / package generated_at = package timing
+{stamp_markdown(data_stamp)}
 """)
-
-    package_generated_at = utc_now()
     manifest = HandoffManifest(
         bridge_version=BRIDGE_VERSION,
         workflow_type="FULL_FUNNEL",
@@ -291,16 +307,19 @@ Clocks (do not conflate):
             "EXECUTION_GRADE=NO does not block Funnel preparation.",
             f"blocked={blocked}",
             "package_generated_at and data_capture_cutoff are distinct from session_date",
+            "See DATA_STAMP.md for Cairo/UTC package time and session close date",
         ],
     )
     finalize_manifest(manifest, pkg)
 
-    zip_path = out_root / f"{project.ticker}_CHATGPT_FUNNEL_HANDOFF.zip"
+    zip_path = out_root / dated_zip_name(f"{project.ticker}_CHATGPT_FUNNEL_HANDOFF", data_stamp)
     zip_directory(pkg, zip_path, arc_root=f"{project.ticker}_CHATGPT_FUNNEL_HANDOFF")
+    write_zip_sidecar(zip_path, data_stamp)
 
     ws_h = workspace_dir(project.ticker, workspace_root) / "handoffs"
     ws_h.mkdir(parents=True, exist_ok=True)
     shutil.copy2(zip_path, ws_h / zip_path.name)
+    copy_zip_sidecar(zip_path, ws_h / zip_path.name)
 
     if store:
         store._conn.execute(

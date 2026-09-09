@@ -9,6 +9,9 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Local/private test suite — keep out of the repo
+tests/
+
 .env
 .env.*
 !.env.example

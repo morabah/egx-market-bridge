@@ -15,6 +15,7 @@ from .freshness import classify_freshness, FreshnessThresholds, egx_session_open
 from .conflicts import select_observation, conflict_to_dict
 from .quality import score_symbol
 from .scanner import compute_scanner_metrics
+from .daily_bars import captured_after_session_close, ohlcv_issue, select_daily_pool, session_of
 from .storage import jdump, rows_to_csv, append_csv, write_handoff, write_scanner_handoff, now_iso
 from .normalize import unwrap_rows, normalize_quote, normalize_depth, normalize_trades, normalize_candles, sym_of
 from .semantics import is_latest_completed_session
@@ -62,6 +63,7 @@ def build_manager(settings: Settings, registry: SymbolRegistry) -> ProviderManag
             enabled=ep.get("tradingview", True),
             username=settings.tradingview_username,
             password=settings.tradingview_password,
+            request_timeout=settings.request_timeout_seconds,
         ),
         BorsaProvider(
             base_url=settings.borsa_base_url,
@@ -329,27 +331,43 @@ def run_once(
                 else:
                     fclass = "UNKNOWN"
                 cd["freshness_class"] = fclass
-                db.upsert_candle(cd)
+                if interval == "1d":
+                    cd["daily_session_complete"] = cd.get("daily_session_complete") is not False and captured_after_session_close(cd)
                 rows.append(cd)
+            received = len(rows)
+            rejected = [row for row in rows if ohlcv_issue(row)]
+            if interval == "1d":
+                from .collect_universe import merge_daily_candles
+                merge_daily_candles(db, rows, refresh=True)
+                daily_rows, _, daily_note = select_daily_pool(db.fetch_candles(symbol, "1d", limit=2000))
+            rows = [row for row in rows if not ohlcv_issue(row)]
+            if interval != "1d":
+                for row in rows:
+                    db.upsert_candle(row)
+            if rejected:
+                warnings.append(f"candles {interval}: rejected {len(rejected)} invalid OHLCV record(s)")
+                jdump(sdir / f"rejected_candles_{interval}.json", rejected)
+            candle_meta[interval] = {
+                "available": bool(rows), "provider": pname, "bars": len(rows),
+                "bars_received": received, "rejected_bars": len(rejected),
+            }
+            if interval == "1d":
+                candle_meta[interval].update({"analysis_bars": len(daily_rows), "analysis_note": daily_note})
             if rows:
                 providers_used.append(pname)
                 rows_to_csv(sdir / f"candles_{interval}.csv", rows)
                 if interval == "1d":
                     rows_to_csv(sdir / "candles.csv", rows)
-                    daily_rows = rows
                 else:
                     intraday_ok = True
                 jdump(outdir / "raw" / (pname or "unknown") / capture[:10] / symbol / f"candles_{interval}.json", rows[-5:])
-                candle_meta[interval] = {
-                    "available": True,
-                    "provider": pname,
-                    "bars": len(rows),
+                candle_meta[interval].update({
                     "latest_timestamp": rows[-1].get("normalized_utc_timestamp") or rows[-1].get("timestamp"),
                     "latest_timestamp_cairo": rows[-1].get("normalized_cairo_timestamp"),
                     "volume_semantics": rows[-1].get("volume_semantics"),
                     "timestamp_semantics": rows[-1].get("timestamp_semantics"),
                     "latest_close": rows[-1].get("close"),
-                }
+                })
 
         # Depth / trades — EGID only, never fabricate
         depth = []
@@ -457,7 +475,7 @@ def run_once(
 
         metrics = compute_scanner_metrics(daily_rows)
         if daily_rows:
-            db.upsert_scanner_signal(symbol, capture[:10], metrics)
+            db.upsert_scanner_signal(symbol, session_of(daily_rows[-1]), metrics)
 
         sym_payload = {
             "symbol": symbol,
@@ -523,55 +541,91 @@ def run_once(
     return payload
 
 
-def refresh_universe(settings: Settings, root: str | Path = ".") -> dict:
+def refresh_universe(settings: Settings, root: str | Path = ".", *, force: bool = True) -> dict:
+    """Refresh all enabled discovery sources once, retaining last-good identities on failure."""
+    from .symbols import canonicalize_any
     root = Path(root)
-    registry = SymbolRegistry.from_config({"symbol_aliases": settings.symbol_aliases})
-    manager = build_manager(settings, registry)
-    db = Database(settings.db_path(root))
     outdir = settings.output_path(root)
-    result = {
-        "last_refresh": now_iso(),
-        "universe_count": 0,
-        "successful_symbols": [],
-        "failed_symbols": [],
-        "unmapped_symbols": [],
-        "note": "Coverage not claimed complete unless verified",
-    }
-    uni, pname, errs = manager.call_first("market_universe", "get_universe")
-    if uni is None:
-        result["failed_symbols"] = errs
-        jdump(outdir / "universe.json", result)
-        db.close()
-        return result
-    for item in uni:
-        sym = item.get("canonical") or item.get("symbol")
-        if not sym:
-            result["unmapped_symbols"].append(item)
+    path = outdir / "universe.json"
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    now = datetime.now(timezone.utc)
+    if not force:
+        for key, ttl in (("last_refresh", 86400), ("last_attempt_at", 900)):
+            try:
+                age = (now - datetime.fromisoformat(previous[key])).total_seconds()
+                if 0 <= age < ttl:
+                    return previous
+            except (KeyError, ValueError, TypeError):
+                pass
+    registry = SymbolRegistry.from_config({"symbol_aliases": settings.symbol_aliases})
+    enabled = settings.enabled_providers or {}
+    def local_path(value):
+        return str(root / value) if value and not Path(value).is_absolute() else value
+    providers = [
+        TradingViewProvider(registry, enabled=enabled.get("tradingview", True), load_backend=False),
+        BorsaProvider(settings.borsa_base_url, enabled=enabled.get("borsa", False), timeout=settings.request_timeout_seconds),
+        InvestorEGXProvider(enabled=enabled.get("investor_egx", True),
+                            universe_path=local_path(settings.investor_egx_universe_path),
+                            sqlite_path=local_path(settings.investor_egx_sqlite_path)),
+    ]
+    records = {r["canonical"]: r for r in previous.get("records", []) if r.get("canonical")}
+    for sym in previous.get("successful_symbols", []):
+        records.setdefault(sym, {"canonical": sym, "source": "cached_discovery"})
+    errors, sources = [], []
+    for provider in providers:
+        if not provider.enabled:
             continue
-        registry.register(sym, name=item.get("name", ""), aliases=item.get("aliases") or {})
-        db.upsert_symbol(sym, name=item.get("name", ""), aliases=registry.get(sym).aliases)
-        result["successful_symbols"].append(sym)
-    result["universe_count"] = len(result["successful_symbols"])
-    result["source"] = pname
-    jdump(outdir / "universe.json", result)
-    db.close()
+        try:
+            rows = provider.get_universe(timeout=settings.request_timeout_seconds) if provider.name == "tradingview" else provider.get_universe()
+            for item in rows:
+                sym = canonicalize_any(item.get("canonical") or item.get("symbol"))
+                if not sym:
+                    continue
+                old = records.get(sym) or {}
+                # Seed data cannot erase verified provider identity metadata.
+                if item.get("source") == "seed" and old:
+                    continue
+                records[sym] = {**old, **item, "canonical": sym}
+            sources.append({"provider": provider.name, "count": len(rows), "checked_at": now.isoformat()})
+        except Exception as exc:
+            errors.append({"provider": provider.name, "error": str(exc)[:240]})
+    result = {
+        "last_attempt_at": now.isoformat(),
+        "last_refresh": now.isoformat() if not errors else previous.get("last_refresh"),
+        "status": "PARTIAL" if errors else "OK",
+        "universe_count": len(records), "successful_symbols": sorted(records),
+        "records": [records[s] for s in sorted(records)],
+        "failed_symbols": errors, "sources": sources,
+        "exchange_completeness_verified": False,
+        "note": "Provider catalog plus retained/imported identities; not an official exchange listing reconciliation.",
+    }
+    db = Database(settings.db_path(root))
+    try:
+        for sym, item in records.items():
+            registry.register(sym, name=item.get("name", ""), aliases=item.get("aliases") or {})
+            db.upsert_symbol(sym, name=item.get("name", ""), aliases=registry.get(sym).aliases)
+        jdump(path, result)
+    finally:
+        db.close()
     return result
 
 
 def loop(settings: Settings, root: str | Path = "."):
-    print(f"EGX Market Bridge v0.3 running every {settings.poll_seconds}s. Ctrl+C to stop.")
+    pause = max(1, settings.poll_seconds)
+    print(f"EGX Market Bridge v0.3 continuous mode; {pause}s between runs. Ctrl+C to stop.")
     while True:
-        start = time.time()
         try:
-            result = run_once(settings, root)
-            print(
-                result["generated_at"],
-                result["status"],
-                [(s["symbol"], s.get("price"), s.get("price_source"), s.get("freshness")) for s in result["symbols"]],
-            )
+            if not settings.session_only or egx_session_open_at(datetime.now(timezone.utc)):
+                result = run_once(settings, root)
+                print(
+                    result["generated_at"], result["status"],
+                    [(s["symbol"], s.get("price"), s.get("price_source"), s.get("freshness")) for s in result["symbols"]],
+                )
         except KeyboardInterrupt:
             raise
         except Exception:
             traceback.print_exc()
-        elapsed = time.time() - start
-        time.sleep(max(1, settings.poll_seconds - elapsed))
+        time.sleep(pause)

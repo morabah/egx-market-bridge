@@ -3,24 +3,25 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from statistics import median
 from typing import Any
 import argparse
 import logging
+import json
 import threading
 import time
 
 from egxbridge import __version__ as BRIDGE_VERSION
 from egxbridge.config import Settings
 from egxbridge.db import Database
-from egxbridge.freshness import classify_freshness
+from egxbridge.daily_bars import daily_session_status, select_daily_pool, session_of, completed_session_rows, captured_after_session_close, ohlcv_issue
 from egxbridge.providers.base import ProviderError
+from egxbridge.providers.tradingview import TradingViewProvider
 from egxbridge.providers.yahoo import YahooProvider
-from egxbridge.resilience import CircuitBreaker, RateLimiter, retry_call
+from egxbridge.resilience import CircuitBreaker, RateLimiter
 from egxbridge.scanner import compute_scanner_metrics
-from egxbridge.semantics import DAILY_BAR, DAILY_CLOSE, DAILY_FINAL_VOLUME
+from egxbridge.semantics import DAILY_BAR, DAILY_CLOSE, DAILY_FINAL_VOLUME, previous_egx_session_date
 from egxbridge.symbols import SymbolRegistry
 from egxbridge.universe import (
     EQUITY,
@@ -50,6 +51,8 @@ EXCLUDED = "EXCLUDED_SECURITY_TYPE"
 
 OVERLAP_CALENDAR_DAYS = 14
 OHLCV_EPS = 1e-6
+RETRY_COOLDOWN_SECONDS = 900
+COLLECTION_BUDGET_SECONDS = 300
 
 
 def _f(v) -> float | None:
@@ -73,7 +76,7 @@ def classify_failure(exc: BaseException, *, has_mapping: bool) -> str:
         return TIMEOUT
     if "invalid" in msg or "delisted" in msg or "not found" in msg:
         return INVALID_SYMBOL
-    if "no yahoo candles" in msg or "no data" in msg or "no yahoo quote" in msg:
+    if "no yahoo candles" in msg or "no tv candles" in msg or "no data" in msg or "no yahoo quote" in msg:
         return NO_DATA
     if isinstance(exc, ProviderError):
         if code == "NO_DATA":
@@ -91,19 +94,18 @@ def _close_enough(a, b) -> bool:
     return abs(fa - fb) <= OHLCV_EPS
 
 
-def _latest_stored(db: Database, symbol: str, provider: str = "yahoo") -> dict[str, Any] | None:
-    rows = db.fetch_candles(symbol, "1d", limit=1)
-    yahoo = [r for r in rows if (r.get("provider") or "").lower() == provider]
-    pool = yahoo or rows
-    return pool[0] if pool else None
-
-
-def _bar_count(db: Database, symbol: str, provider: str = "yahoo") -> int:
+def _bar_count(db: Database, symbol: str, provider: str | None = "yahoo") -> int:
     try:
-        row = db._conn.execute(
-            "SELECT COUNT(*) AS c FROM candles WHERE symbol=? AND interval='1d' AND provider=?",
-            (symbol.upper(), provider),
-        ).fetchone()
+        if provider:
+            row = db._conn.execute(
+                "SELECT COUNT(*) AS c FROM candles WHERE symbol=? AND interval='1d' AND provider=?",
+                (symbol.upper(), provider),
+            ).fetchone()
+        else:
+            row = db._conn.execute(
+                "SELECT COUNT(*) AS c FROM candles WHERE symbol=? AND interval='1d'",
+                (symbol.upper(),),
+            ).fetchone()
         return int(row["c"] if hasattr(row, "keys") else row[0])
     except Exception:
         return 0
@@ -111,7 +113,7 @@ def _bar_count(db: Database, symbol: str, provider: str = "yahoo") -> int:
 
 def _existing_row(db: Database, symbol: str, interval: str, timestamp: str, provider: str):
     return db._conn.execute(
-        """SELECT open, high, low, close, volume FROM candles
+        """SELECT open, high, low, close, volume, capture_timestamp, semantics_json FROM candles
            WHERE symbol=? AND interval=? AND timestamp=? AND provider=?""",
         (symbol, interval, timestamp, provider),
     ).fetchone()
@@ -125,51 +127,78 @@ def merge_daily_candles(
 ) -> dict[str, int]:
     """De-dupe by canonical_symbol + session/timestamp + provider + interval.
 
-    Conflicting historical bars are logged and kept unless refresh=True.
+    Recent provider corrections replace old values with an audit trail. Older history
+    is retained unless refresh=True; older captures never overwrite newer captures.
     """
     inserted = 0
     skipped = 0
     conflicts = 0
-    for c in candles:
-        d = dict(c)
-        d.setdefault("interval", "1d")
-        d.setdefault("provider", "yahoo")
-        d["price_observation_type"] = d.get("price_observation_type") or DAILY_CLOSE
-        d["timestamp_semantics"] = d.get("timestamp_semantics") or DAILY_BAR
-        d["volume_semantics"] = d.get("volume_semantics") or DAILY_FINAL_VOLUME
-        d["volume_interval"] = d.get("volume_interval") or "1d"
-        ts = d.get("normalized_utc_timestamp") or d.get("timestamp")
-        if not ts or not d.get("symbol"):
-            skipped += 1
-            continue
-        prev = _existing_row(db, d["symbol"], d["interval"], ts, d["provider"])
-        if prev is not None:
-            keys = ("open", "high", "low", "close", "volume")
-            if all(_close_enough(prev[k] if hasattr(prev, "keys") else prev[i], d.get(k))
-                   for i, k in enumerate(keys)):
+    rejected = 0
+    recent_cutoff = (datetime.fromisoformat(previous_egx_session_date()) - timedelta(days=OVERLAP_CALENDAR_DAYS)).date().isoformat()
+    with db._conn:
+        for c in candles:
+            d = dict(c)
+            d.setdefault("interval", "1d")
+            d.setdefault("provider", "yahoo")
+            d["price_observation_type"] = d.get("price_observation_type") or DAILY_CLOSE
+            d["timestamp_semantics"] = d.get("timestamp_semantics") or DAILY_BAR
+            d["volume_semantics"] = d.get("volume_semantics") or DAILY_FINAL_VOLUME
+            d["volume_interval"] = d.get("volume_interval") or "1d"
+            ts = d.get("normalized_utc_timestamp") or d.get("timestamp")
+            if not ts or not d.get("symbol"):
                 skipped += 1
                 continue
-            conflicts += 1
-            db.insert_conflict({
-                "symbol": d["symbol"],
-                "field": "daily_ohlcv",
-                "provider_a": d["provider"],
-                "value_a": {k: (prev[k] if hasattr(prev, "keys") else prev[i]) for i, k in enumerate(keys)},
-                "timestamp_a": ts,
-                "provider_b": d["provider"],
-                "value_b": {k: d.get(k) for k in keys},
-                "timestamp_b": ts,
-                "selected_provider": d["provider"] if refresh else "local_existing",
-                "reason": "incremental_history_conflict",
-                "created_at": utc_now(),
-            })
-            log.warning("daily conflict %s %s kept=%s", d["symbol"], ts, "new" if refresh else "existing")
-            if not refresh:
-                skipped += 1
+            prev = _existing_row(db, d["symbol"], d["interval"], ts, d["provider"])
+            issue = ohlcv_issue(d)
+            if issue:
+                rejected += 1
+                db.insert_conflict({
+                    "symbol": d["symbol"], "field": "daily_ohlcv_validation",
+                    "provider_a": d["provider"], "provider_b": d["provider"],
+                    "timestamp_a": ts, "timestamp_b": ts,
+                    "value_b": json.dumps(d, default=str),
+                    "selected_provider": "local_existing" if prev else "REJECTED",
+                    "reason": issue, "created_at": utc_now(),
+                }, commit=False)
                 continue
-        db.upsert_candle(d)
-        inserted += 1
-    return {"inserted": inserted, "skipped": skipped, "conflicts": conflicts}
+            if prev is not None:
+                old_capture = prev["capture_timestamp"] or ""
+                if old_capture and d.get("capture_timestamp") and d["capture_timestamp"] < old_capture:
+                    skipped += 1
+                    continue
+                replace = refresh or session_of(d) >= recent_cutoff
+                keys = ("open", "high", "low", "close", "volume")
+                if all(_close_enough(prev[k] if hasattr(prev, "keys") else prev[i], d.get(k))
+                       for i, k in enumerate(keys)):
+                    semantics = json.loads(prev["semantics_json"] or "{}")
+                    old_final = semantics.get("daily_session_complete") is not False and captured_after_session_close({**dict(prev), **semantics})
+                    if not old_final and d.get("daily_session_complete") is True and captured_after_session_close(d):
+                        db.upsert_candle(d, commit=False)
+                        inserted += 1
+                        continue
+                    skipped += 1
+                    continue
+                conflicts += 1
+                db.insert_conflict({
+                    "symbol": d["symbol"],
+                    "field": "daily_ohlcv",
+                    "provider_a": d["provider"],
+                    "value_a": {k: (prev[k] if hasattr(prev, "keys") else prev[i]) for i, k in enumerate(keys)},
+                    "timestamp_a": ts,
+                    "provider_b": d["provider"],
+                    "value_b": {k: d.get(k) for k in keys},
+                    "timestamp_b": ts,
+                    "selected_provider": d["provider"] if replace else "local_existing",
+                    "reason": "incremental_history_conflict",
+                    "created_at": utc_now(),
+                }, commit=False)
+                log.warning("daily conflict %s %s kept=%s", d["symbol"], ts, "new" if replace else "existing")
+                if not replace:
+                    skipped += 1
+                    continue
+            db.upsert_candle(d, commit=False)
+            inserted += 1
+    return {"inserted": inserted, "skipped": skipped, "conflicts": conflicts, "rejected": rejected}
 
 
 def _candle_to_store(c) -> dict[str, Any]:
@@ -178,146 +207,154 @@ def _candle_to_store(c) -> dict[str, Any]:
     d["timestamp_semantics"] = d.get("timestamp_semantics") or DAILY_BAR
     d["volume_semantics"] = DAILY_FINAL_VOLUME
     d["volume_interval"] = "1d"
+    d["daily_session_complete"] = d.get("daily_session_complete") is not False and captured_after_session_close(d)
     return d
 
 
 def collect_one_symbol(
-    rec: UniverseRecord,
-    *,
-    db: Database,
-    yahoo: YahooProvider,
-    registry: SymbolRegistry,
-    limiter: RateLimiter,
-    limiter_lock: threading.Lock,
-    breaker: CircuitBreaker,
-    history_days: int,
-    min_cache_bars: int,
-    refresh: bool,
-    dry_run: bool,
+    rec: UniverseRecord, *, db: Database, yahoo: YahooProvider | None,
+    registry: SymbolRegistry, limiter: RateLimiter, limiter_lock: threading.Lock,
+    breaker: CircuitBreaker, history_days: int, min_cache_bars: int,
+    refresh: bool, dry_run: bool, tradingview: TradingViewProvider | None = None,
+    use_tradingview_fallback: bool = False, expected_session: str | None = None,
+    tv_breaker: CircuitBreaker | None = None,
+    previous_result: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    t0 = time.time()
+    t0 = time.monotonic()
     sym = rec.canonical_symbol
-    out: dict[str, Any] = {
-        "ticker": sym,
-        "security_type": rec.security_type,
-        "yahoo_alias": rec.provider_alias_yahoo,
-        "status": UNKNOWN_FAILURE,
-        "cache_hit": False,
-        "network_fetch": False,
-        "bars_stored": 0,
-        "bars_fetched": 0,
-        "latency_ms": None,
-        "error": None,
-        "incremental": False,
-        "conflicts": 0,
+    expected = expected_session or previous_egx_session_date()
+    out = {
+        "ticker": sym, "company_name": rec.display_name_if_known,
+        "security_type": rec.security_type, "yahoo_alias": rec.provider_alias_yahoo,
+        "status": UNKNOWN_FAILURE, "cache_hit": False, "network_fetch": False,
+        "bars_stored": 0, "bars_fetched": 0, "error": None,
+        "incremental": False, "conflicts": 0, "started_at": utc_now(),
+        "expected_session": expected, "attempts": [],
     }
+    def finish(status):
+        out["status"] = status
+        out["finished_at"] = utc_now()
+        out["latency_ms"] = round((time.monotonic() - t0) * 1000, 2)
+        return out
+
     if rec.security_type != EQUITY:
-        out["status"] = EXCLUDED
         out["error"] = rec.exclusion_reason or f"EXCLUDED_{rec.security_type}"
-        out["latency_ms"] = round((time.time() - t0) * 1000, 2)
-        return out
-    if not rec.mapped or not rec.provider_alias_yahoo:
-        out["status"] = NO_MAPPING
-        out["latency_ms"] = round((time.time() - t0) * 1000, 2)
-        return out
-
-    registry.register(
-        rec.canonical_symbol,
-        aliases={
-            "yahoo": rec.provider_alias_yahoo,
-            "tradingview": rec.provider_alias_tradingview,
+        return finish(EXCLUDED)
+    if not rec.mapped:
+        return finish(NO_MAPPING)
+    if not dry_run:
+        db.upsert_symbol(sym, name=rec.display_name_if_known, aliases={
+            "yahoo": rec.provider_alias_yahoo, "tradingview": rec.provider_alias_tradingview,
             "egid": rec.provider_alias_egid,
-        },
-    )
-    db.upsert_symbol(
-        rec.canonical_symbol,
-        name=rec.display_name_if_known,
-        aliases={
-            "yahoo": rec.provider_alias_yahoo,
-            "tradingview": rec.provider_alias_tradingview,
-            "egid": rec.provider_alias_egid,
-        },
-    )
+        })
 
-    existing_n = _bar_count(db, sym)
-    latest = _latest_stored(db, sym)
-    start = None
-    cairo_today = datetime.now(ZoneInfo("Africa/Cairo")).date()
-    if latest and not refresh and existing_n >= min_cache_bars:
-        sess = (latest.get("session_date") or str(latest.get("timestamp") or ""))[:10]
-        try:
-            sess_d = datetime.fromisoformat(sess).date()
-        except Exception:
-            sess_d = None
-        if sess_d is not None and sess_d >= cairo_today:
-            out["status"] = CACHE_HIT
-            out["cache_hit"] = True
-            out["bars_stored"] = existing_n
-            out["latency_ms"] = round((time.time() - t0) * 1000, 2)
-            return out
-    if latest and not refresh:
-        sess = (latest.get("session_date") or str(latest.get("timestamp") or ""))[:10]
-        try:
-            d0 = datetime.fromisoformat(sess)
-            start = (d0 - timedelta(days=OVERLAP_CALENDAR_DAYS)).date().isoformat()
-            out["incremental"] = True
-        except Exception:
-            start = None
+    def stored_pool():
+        return select_daily_pool(db.fetch_candles(sym, "1d", limit=5000), through_session=expected)
 
+    def describe(pool, provider):
+        latest = pool[-1] if pool else {}
+        out.update({
+            "provider": provider, "bars_stored": len(pool),
+            "first_session": session_of(pool[0]) if pool else None,
+            "latest_session": session_of(latest) or None,
+            "source_timestamp": latest.get("normalized_utc_timestamp") or latest.get("timestamp"),
+            "data_captured_at": latest.get("capture_timestamp"),
+            "data_state": "MISSING" if not pool else "STALE" if session_of(latest) < expected else "CURRENT",
+            "history_sufficient": len(pool) >= min_cache_bars,
+        })
+    pool, provider, _ = stored_pool()
+    describe(pool, provider)
+    if not refresh and out["data_state"] == "CURRENT" and out["history_sufficient"]:
+        out["cache_hit"] = True
+        return finish(CACHE_HIT)
     if dry_run:
-        out["status"] = "DRY_RUN"
-        out["bars_stored"] = existing_n
-        out["latency_ms"] = round((time.time() - t0) * 1000, 2)
-        return out
+        return finish("DRY_RUN")
+    previous = previous_result or {}
+    if not refresh and previous.get("expected_session") == expected:
+        try:
+            retry_at = datetime.fromisoformat(previous["retry_after"])
+            if datetime.now(timezone.utc) < retry_at:
+                out.update(retry_deferred=True, retry_after=previous["retry_after"], error=previous.get("error"))
+                return finish(previous.get("status") or NO_DATA)
+        except (KeyError, TypeError, ValueError):
+            pass
 
-    if not breaker.allow():
-        out["status"] = RATE_LIMITED
-        out["error"] = "circuit_breaker_open"
-        out["latency_ms"] = round((time.time() - t0) * 1000, 2)
-        return out
-
-    try:
-        with limiter_lock:
-            limiter.wait()
-        n_bars = max(int(history_days), 120)
-
-        def _fetch():
-            if start:
-                return yahoo.get_candles(sym, "1d", n_bars=n_bars, start=start)
-            return yahoo.get_candles(sym, "1d", n_bars=n_bars)
-
-        candles = retry_call(_fetch, retries=1, base_delay=0.8, retry_on=(ProviderError, TimeoutError, OSError))
-        breaker.record_success()
-        out["network_fetch"] = True
-        out["bars_fetched"] = len(candles or [])
-        out["latency_ms"] = getattr(yahoo, "_latency_ms", None)
-        if not candles:
-            out["status"] = NO_DATA
-            return out
-        payload = [_candle_to_store(c) for c in candles]
-        merge = merge_daily_candles(db, payload, refresh=refresh)
-        out["conflicts"] = merge["conflicts"]
-        out["bars_stored"] = _bar_count(db, sym)
-        if merge["inserted"] == 0 and existing_n >= min_cache_bars:
-            out["cache_hit"] = True
-        latest2 = _latest_stored(db, sym)
-        ts = (latest2 or {}).get("normalized_utc_timestamp") or (latest2 or {}).get("timestamp")
-        fclass, _ = classify_freshness(ts) if ts else ("UNKNOWN", None)
-        if fclass == "STALE_UNEXPECTED":
-            out["status"] = STALE_UNEXPECTED
-        elif fclass == "STALE_EXPECTED":
-            out["status"] = STALE_EXPECTED
-        else:
-            out["status"] = SUCCESS
-        return out
-    except Exception as e:
-        breaker.record_failure()
-        out["status"] = classify_failure(e, has_mapping=True)
-        out["error"] = str(e)
-        out["network_fetch"] = True
-        out["latency_ms"] = getattr(yahoo, "_latency_ms", None) or round((time.time() - t0) * 1000, 2)
-        log.warning("collect failed %s: %s", sym, e)
-        return out
+    n_bars = max(int(history_days), int(min_cache_bars), 120)
+    providers = [("yahoo", yahoo, breaker)] if yahoo is not None else []
+    if use_tradingview_fallback and tradingview is not None:
+        providers.append(("tradingview", tradingview, tv_breaker or CircuitBreaker()))
+    last_failure = NO_DATA
+    for name, provider_obj, circuit in providers:
+        if not getattr(provider_obj, "enabled", True):
+            out["attempts"].append({"provider": name, "status": "DISABLED"})
+            continue
+        provider_rows = [r for r in db.fetch_candles(sym, "1d", limit=5000) if r.get("provider") == name]
+        own_pool, _, _ = select_daily_pool(provider_rows, through_session=expected)
+        start = None
+        if not refresh and len(own_pool) >= min_cache_bars:
+            start = (datetime.fromisoformat(session_of(own_pool[-1])) - timedelta(days=OVERLAP_CALENDAR_DAYS)).date().isoformat()
+        for attempt in range(2):
+            if deadline is not None and time.monotonic() >= deadline:
+                out["attempts"].append({"provider": name, "status": "COLLECTION_TIME_LIMIT"})
+                out["error"] = "Collection time limit reached. Remaining data gaps can be retried manually."
+                last_failure = "COLLECTION_TIME_LIMIT"
+                break
+            with limiter_lock:
+                allowed = circuit.allow()
+                if allowed:
+                    limiter.wait()
+            if not allowed:
+                out["attempts"].append({"provider": name, "status": "CIRCUIT_OPEN"})
+                if not out["network_fetch"]:
+                    last_failure = "CIRCUIT_OPEN"
+                break
+            out["network_fetch"] = True
+            detail = {"provider": name, "attempt": attempt + 1, "started_at": utc_now()}
+            try:
+                kwargs = {"start": start} if name == "yahoo" and start else {}
+                candles = provider_obj.get_candles(sym, "1d", n_bars=n_bars, **kwargs) or []
+                payload = [_candle_to_store(c) for c in candles]
+                for row in payload:
+                    row["provider"] = name
+                payload = completed_session_rows(payload, through_session=expected)
+                with limiter_lock:
+                    circuit.record_success()
+                merge = merge_daily_candles(db, payload, refresh=refresh)
+                out["conflicts"] += merge["conflicts"]
+                out["bars_fetched"] += len(payload) - merge["rejected"]
+                out["incremental"] = out["incremental"] or bool(kwargs)
+                detail.update(status="INVALID_DATA" if merge["rejected"] else SUCCESS if payload else NO_DATA,
+                              bars=len(payload) - merge["rejected"], rejected_bars=merge["rejected"])
+                if name == "tradingview" and payload:
+                    out["fallback_provider"] = name
+                last_failure = NO_DATA
+            except Exception as exc:
+                last_failure = classify_failure(exc, has_mapping=True)
+                detail.update(status=last_failure, error=str(exc)[:240])
+                out["error"] = str(exc)[:240]
+                with limiter_lock:
+                    if last_failure in {NO_DATA, INVALID_SYMBOL, NO_MAPPING}:
+                        circuit.record_success()
+                    else:
+                        circuit.record_failure()
+            detail["finished_at"] = utc_now()
+            out["attempts"].append(detail)
+            # Empty/missing symbols and rate limits are not improved by immediate retries.
+            if detail["status"] not in {TIMEOUT, PROVIDER_ERROR, UNKNOWN_FAILURE} or attempt == 1:
+                break
+            time.sleep(0.8)
+        pool, selected, _ = stored_pool()
+        describe(pool, selected)
+        if out["data_state"] == "CURRENT" and out["history_sufficient"]:
+            break
+    if out["data_state"] != "CURRENT" or not out["history_sufficient"]:
+        out["retry_after"] = (datetime.now(timezone.utc) + timedelta(seconds=RETRY_COOLDOWN_SECONDS)).isoformat()
+    if out["data_state"] == "CURRENT":
+        return finish(SUCCESS)
+    if pool:
+        return finish(STALE_UNEXPECTED)
+    return finish(last_failure)
 
 
 def collect_universe_daily(
@@ -331,35 +368,81 @@ def collect_universe_daily(
     dry_run: bool = False,
     min_cache_bars: int = 120,
     yahoo: YahooProvider | None = None,
+    tradingview: TradingViewProvider | None = None,
+    supplemental_fetch=None,
     include_non_equity: bool = False,
+    force_tradingview_fallback: bool | None = None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
-    t0 = time.time()
-    settings = settings or Settings.load(HERE / "config.json")
+    t0 = time.monotonic()
+    started_at = utc_now()
+    use_supplemental = supplemental_fetch is not None or yahoo is None
+    root = root or HERE
+    settings = settings or Settings.load(root / "config.json")
+    owned_db = db is None
     if db is None:
-        db = Database(settings.db_path(HERE))
+        db = Database(settings.db_path(root))
+    discovery = None
+    if not dry_run and symbols is None and yahoo is None:
+        from egxbridge.collector import refresh_universe
+        discovery = refresh_universe(settings, root, force=False)
     registry = SymbolRegistry.from_config({"symbol_aliases": settings.symbol_aliases})
-    built = build_canonical_universe(db=db, explicit=symbols)
+    built = build_canonical_universe(db=db, explicit=symbols, settings=settings, root=root)
     records: list[UniverseRecord] = list(built["records"])
     if not include_non_equity:
         work = [r for r in records if r.security_type == EQUITY]
     else:
         work = records
 
-    yahoo = yahoo or YahooProvider(registry, enabled=True, timeout=int(settings.request_timeout_seconds or 20))
+    for rec in records:
+        registry.register(rec.canonical_symbol, aliases={
+            "yahoo": rec.provider_alias_yahoo, "tradingview": rec.provider_alias_tradingview,
+            "egid": rec.provider_alias_egid,
+        })
+    yahoo = yahoo or YahooProvider(registry, enabled=(settings.enabled_providers or {}).get("yahoo", True), timeout=int(settings.request_timeout_seconds or 20))
+    expected = previous_egx_session_date()
+    use_tv = force_tradingview_fallback is not False and not dry_run
+    if use_tv and tradingview is None and (settings.enabled_providers or {}).get("tradingview", True):
+        tradingview = TradingViewProvider(registry, username=settings.tradingview_username or "", password=settings.tradingview_password or "", request_timeout=int(settings.request_timeout_seconds or 20))
+        if tradingview._tv is None:
+            tradingview = None
+    use_tv = use_tv and tradingview is not None
+    lag_probe = {"expected_session": expected, "use_tradingview_fallback": use_tv,
+                 "note": "Fallback decided per company; no repeated sample probes."}
     limiter = RateLimiter(min_interval_seconds=max(float(settings.rate_limit_seconds or 0.5), 0.5))
     limiter_lock = threading.Lock()
     breaker = CircuitBreaker(fail_threshold=8, cool_down_seconds=45)
+    tv_breaker = CircuitBreaker(fail_threshold=3, cool_down_seconds=45)
 
     results: list[dict[str, Any]] = []
     workers = max(1, min(int(max_workers or 1), 4))
 
-    def _job(rec: UniverseRecord) -> dict[str, Any]:
+    report_path = db.path.parent / "daily_collection_report.json"
+    try:
+        previous_report = json.loads(report_path.read_text(encoding="utf-8"))
+        previous_results = {r["ticker"]: r for r in previous_report.get("results", [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        previous_results = {}
+    worker_state = threading.local()
+    worker_dbs = []
+    run_id = db.start_run([r.canonical_symbol for r in work]) if not dry_run else None
+
+    def _job(rec: UniverseRecord, primary: bool = True) -> dict[str, Any]:
         try:
+            if workers > 1 and not hasattr(worker_state, "db"):
+                worker_state.db = Database(db.path)
+                with limiter_lock:
+                    worker_dbs.append(worker_state.db)
             return collect_one_symbol(
-                rec, db=db, yahoo=yahoo, registry=registry,
+                rec, db=worker_state.db if workers > 1 else db, yahoo=yahoo if primary else None, registry=registry,
                 limiter=limiter, limiter_lock=limiter_lock, breaker=breaker,
                 history_days=history_days, min_cache_bars=min_cache_bars,
                 refresh=refresh, dry_run=dry_run,
+                tradingview=tradingview if use_tv and not primary else None,
+                use_tradingview_fallback=use_tv and not primary,
+                expected_session=expected, tv_breaker=tv_breaker,
+                previous_result=previous_results.get(rec.canonical_symbol) if primary else None,
+                deadline=t0 + COLLECTION_BUDGET_SECONDS,
             )
         except Exception as e:
             return {
@@ -374,23 +457,47 @@ def collect_universe_daily(
                 "latency_ms": None,
             }
 
-    if workers == 1:
-        for rec in work:
-            results.append(_job(rec))
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+    ex = None
+    try:
+        if workers == 1:
+            for rec in work:
+                results.append(_job(rec))
+        else:
+            ex = ThreadPoolExecutor(max_workers=workers)
             futs = {ex.submit(_job, rec): rec.canonical_symbol for rec in work}
             for fut in as_completed(futs):
-                try:
-                    results.append(fut.result())
-                except Exception as e:
-                    results.append({
-                        "ticker": futs[fut],
-                        "status": UNKNOWN_FAILURE,
-                        "error": str(e),
-                        "cache_hit": False,
-                        "network_fetch": False,
-                    })
+                results.append(fut.result())
+        # Reach the entire catalog with the primary source before slow fallbacks
+        # consume the shared time budget. Reuse the same collector and workers.
+        if use_tv:
+            primary_by = {r["ticker"]: r for r in results}
+            gaps = [r for r in work if r.security_type == EQUITY and r.mapped
+                    and not primary_by[r.canonical_symbol].get("retry_deferred")
+                    and (primary_by[r.canonical_symbol].get("data_state") != "CURRENT"
+                         or not primary_by[r.canonical_symbol].get("history_sufficient"))]
+            fallback_results = ([_job(r, False) for r in gaps] if ex is None else
+                                [f.result() for f in as_completed([ex.submit(_job, r, False) for r in gaps])])
+            for result in fallback_results:
+                first = primary_by[result["ticker"]]
+                result["attempts"] = first.get("attempts", []) + result.get("attempts", [])
+                result["started_at"] = first.get("started_at")
+                for field in ("bars_fetched", "conflicts", "latency_ms"):
+                    result[field] = (first.get(field) or 0) + (result.get(field) or 0)
+                for field in ("network_fetch", "incremental", "cache_hit"):
+                    result[field] = bool(first.get(field) or result.get(field))
+                primary_by[result["ticker"]] = result
+            results = list(primary_by.values())
+    except BaseException:
+        if run_id is not None:
+            db.finish_run(run_id, "INTERRUPTED", notes="Collection interrupted; pending companies were not retried.")
+        if owned_db:
+            db.close()
+        raise
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True, cancel_futures=True)
+        for connection in worker_dbs:
+            connection.close()
 
     # Preserve excluded registry names in the failure/status table
     done = {r.get("ticker") for r in results}
@@ -413,26 +520,79 @@ def collect_universe_daily(
     latencies = [float(r["latency_ms"]) for r in results if r.get("latency_ms") is not None]
     ok = [r for r in results if r.get("status") in {SUCCESS, CACHE_HIT, STALE_EXPECTED}]
     failed = [r for r in results if r.get("status") not in {SUCCESS, CACHE_HIT, STALE_EXPECTED, EXCLUDED, "DRY_RUN"}]
-    elapsed = time.time() - t0
+    supplemental = {"status": "NOT_REQUESTED", "network_attempts": 0}
+    if not dry_run and use_supplemental and (settings.enabled_providers or {}).get("egxpilot", True):
+        from egxbridge.providers.egxpilot import fetch_market_snapshot
+        supplemental = (supplemental_fetch or fetch_market_snapshot)(
+            [r.canonical_symbol for r in work], timeout=settings.request_timeout_seconds,
+        )
+    elapsed = time.monotonic() - t0
     performance = {
         "total_universe_collection_time_seconds": round(elapsed, 3),
         "successful_symbols": len(ok),
+        "current_symbols": sum(r.get("data_state") == "CURRENT" for r in results),
+        "stale_symbols": sum(r.get("data_state") == "STALE" for r in results),
+        "missing_symbols": sum(r.get("data_state") == "MISSING" for r in results),
+        "network_attempts": sum(1 for r in results for a in r.get("attempts", []) if a.get("attempt")) + supplemental.get("network_attempts", 0),
+        "supplemental_snapshot_requests": supplemental.get("network_attempts", 0),
+        "rejected_daily_bars": sum(a.get("rejected_bars", 0) for r in results for a in r.get("attempts", [])),
+        "provider_circuit_skips": sum(a.get("status") == "CIRCUIT_OPEN" for r in results for a in r.get("attempts", [])),
+        "collection_time_limit_skips": sum(a.get("status") == "COLLECTION_TIME_LIMIT" for r in results for a in r.get("attempts", [])),
+        "collection_budget_seconds": COLLECTION_BUDGET_SECONDS,
         "failed_symbols": len(failed),
+        "insufficient_history_symbols": sum(r.get("history_sufficient") is False for r in results if r.get("data_state") == "CURRENT"),
         "excluded_symbols": sum(1 for r in results if r.get("status") == EXCLUDED),
         "cache_hits": sum(1 for r in results if r.get("cache_hit")),
         "network_fetches": sum(1 for r in results if r.get("network_fetch")),
+        "deferred_retries": sum(1 for r in results if r.get("retry_deferred")),
         "average_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
         "median_latency_ms": round(median(latencies), 2) if latencies else None,
         "max_workers": workers,
         "history_days": history_days,
         "bridge_version": BRIDGE_VERSION,
+        "tradingview_fallback_used": use_tv,
+        "expected_session": expected,
+        "yahoo_probe_session": lag_probe.get("yahoo_session"),
+        "tradingview_probe_session": lag_probe.get("tradingview_session"),
     }
-    return {
-        "universe": built,
-        "results": results,
-        "performance": performance,
-        "generated_at": utc_now(),
+    report = {
+        "source_database": str(Path(db.path).resolve()),
+        "status": "DRY_RUN" if dry_run else "OK" if work and not failed and not performance["insufficient_history_symbols"] and not performance["rejected_daily_bars"] and not (discovery and discovery.get("status") != "OK") else "PARTIAL",
+        "scope": "SELECTED_SYMBOLS" if symbols else "FULL_KNOWN_UNIVERSE",
+        "started_at": started_at, "finished_at": utc_now(),
+        "expected_session": expected, "results": results, "performance": performance,
+        "supplemental_market_snapshot": supplemental,
+        "catalog_status": built.get("catalog_status"), "discovery": discovery,
+        "equity_count": built.get("EQUITY_UNIVERSE_TOTAL"),
+        "exchange_completeness_verified": False,
     }
+    if not dry_run:
+        from egxbridge.storage import jdump
+        jdump(report_path, report)
+        db.finish_run(run_id, report["status"], [r["ticker"] + ": " + r["status"] for r in failed],
+                      notes=json.dumps({"kind": "universe_daily", "report_path": str(report_path)}))
+    if owned_db:
+        db.close()
+    return {"universe": built, "results": results, "performance": performance,
+            "lag_probe": lag_probe, "generated_at": report["finished_at"],
+            "status": report["status"], "report": report, "report_path": str(report_path)}
+
+
+
+def collection_report_for_db(db, *, as_of: datetime) -> dict[str, Any]:
+    """Freeze only a completed report from the database used by this package."""
+    unavailable = {"status": "UNAVAILABLE", "reason": "No verified collection report for this database and cutoff."}
+    if db is None or not getattr(db, "path", None):
+        return unavailable
+    db_path = Path(db.path).resolve()
+    try:
+        report = json.loads((db_path.parent / "daily_collection_report.json").read_text())
+        finished = datetime.fromisoformat(report["finished_at"].replace("Z", "+00:00"))
+        if report.get("source_database") == str(db_path) and finished <= as_of:
+            return report
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return unavailable
 
 
 def enrich_metrics_fields(metrics: dict[str, Any], *, latest_session: str | None = None) -> dict[str, Any]:
@@ -446,15 +606,16 @@ def enrich_metrics_fields(metrics: dict[str, Any], *, latest_session: str | None
 
 
 def compute_daily_metrics_for_symbol(db: Database, symbol: str, *, limit: int = 300) -> dict[str, Any]:
-    rows = db.fetch_candles(symbol, "1d", limit=limit)
-    # Prefer yahoo daily
-    yahoo = [r for r in rows if (r.get("provider") or "").lower() == "yahoo"]
-    pool = yahoo or rows
-    pool = sorted(pool, key=lambda c: c.get("normalized_utc_timestamp") or c.get("timestamp") or "")
+    rows = db.fetch_candles(symbol, "1d", limit=5000)
+    pool, provider, note = select_daily_pool(rows)
+    pool = pool[-limit:]
     metrics = compute_scanner_metrics(pool)
-    latest_session = None
-    if pool:
-        latest_session = pool[-1].get("session_date") or str(pool[-1].get("timestamp") or "")[:10]
+    latest_session = session_of(pool[-1]) if pool else None
+    metrics["daily_provider"] = provider
+    metrics["daily_provider_note"] = note
+    status = daily_session_status(pool)
+    metrics["expected_session"] = status.get("expected_session")
+    metrics["daily_bars_lagging"] = status.get("lagging")
     return enrich_metrics_fields(metrics, latest_session=latest_session)
 
 

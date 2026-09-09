@@ -292,7 +292,10 @@ def update_outcomes_for_store(store, db, *, pending_only: bool = True, through_s
     cache, updated, skipped = {}, 0, 0
     def bars_for(ticker):
         if ticker not in cache:
-            cache[ticker] = db.fetch_candles(ticker, "1d", limit=-1) if db else []
+            raw = db.fetch_candles(ticker, "1d", limit=-1) if db else []
+            from egxbridge.daily_bars import select_daily_pool
+            pool, _prov, _note = select_daily_pool(raw)
+            cache[ticker] = pool
         return cache[ticker]
     for sig in signals:
         cid = sig["canonical_signal_id"]

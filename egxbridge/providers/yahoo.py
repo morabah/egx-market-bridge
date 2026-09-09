@@ -86,6 +86,10 @@ class YahooProvider(MarketDataProvider):
             import yfinance as yf
         except ImportError as e:
             raise ProviderError(self.name, "yfinance not installed") from e
+        # Otherwise yfinance can turn DNS/transport failures into "delisted" empty
+        # frames, defeating the collector's provider circuit breaker.
+        if getattr(getattr(yf, "config", None), "debug", None) is not None:
+            yf.config.debug.hide_exceptions = False
         ysym = self.symbol_resolver.to_provider(symbol, "yahoo")
         return yf.Ticker(ysym), ysym
 
@@ -109,7 +113,7 @@ class YahooProvider(MarketDataProvider):
         start = time.time()
         try:
             ticker, ysym = self._ticker(symbol)
-            hist = ticker.history(period="5d", auto_adjust=False)
+            hist = ticker.history(period="5d", auto_adjust=False, timeout=self.timeout, raise_errors=True)
             self._latency_ms = (time.time() - start) * 1000
             capture = utc_now_iso()
             if hist is None or len(hist) == 0:
@@ -189,7 +193,7 @@ class YahooProvider(MarketDataProvider):
             period = "5d" if yf_interval.endswith("m") or yf_interval == "60m" else "1y"
             if n_bars > 200 and yf_interval == "1d":
                 period = "2y"
-            hist_kwargs = {"interval": yf_interval, "auto_adjust": False}
+            hist_kwargs = {"interval": yf_interval, "auto_adjust": False, "timeout": self.timeout, "raise_errors": True}
             if start and yf_interval == "1d":
                 hist_kwargs["start"] = start
             else:

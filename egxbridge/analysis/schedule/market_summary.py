@@ -61,7 +61,13 @@ def _eligible_row(row: dict[str, Any]) -> bool:
     if not _is_equity_row(row):
         return False
     status = str(_pick(row, "data_status") or "").upper()
-    if any(tok in status for tok in ("UNAVAILABLE", "NO_MAPPING", "INSUFFICIENT", "EXCLUDED")):
+    if any(tok in status for tok in ("UNAVAILABLE", "NO_MAPPING", "INSUFFICIENT", "EXCLUDED", "STALE")):
+        return False
+    if _boolish(_pick(row, "daily_bars_lagging")) is True:
+        return False
+    expected = _pick(row, "expected_session")
+    actual = _pick(row, "latest_session", "session_date")
+    if expected and actual != expected:
         return False
     if _pick(row, "available") in {False, "False", "false", "0"}:
         return False
@@ -216,6 +222,8 @@ def compact_scanner_metric_row(row: dict[str, Any]) -> dict[str, Any]:
         "breakout_60d": _pick(row, "breakout_60d", "breakout_flag_60d"),
         "realized_vol_20d_ann_pct": _pick(row, "realized_vol_20d_ann_pct"),
         "latest_session": _pick(row, "latest_completed_market_session", "latest_session", "session_date"),
+        "expected_session": _pick(row, "expected_session"),
+        "daily_bars_lagging": _pick(row, "daily_bars_lagging"),
     }
 
 

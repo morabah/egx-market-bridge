@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 
 import pandas as pd
 import streamlit as st
@@ -103,29 +104,46 @@ def render_daily_operator(*, store=None, funnel_reg=None, db=None, root: Path | 
     focus = focus_steps(code)
 
     live = snap.get("session_phase") == "CONTINUOUS_TRADING"
+    # Do not force TradingView into Scan market — that path is daily-only and fast.
+    # Today's Intraday shortcut handles live bars.
     if "enrich_tv_now" not in st.session_state:
-        st.session_state["enrich_tv_now"] = live
+        st.session_state["enrich_tv_now"] = False
 
     operator_hero(
         title="Daily Operator",
-        session=snap.get("latest_completed_market_session"),
+        session=snap.get("price_session") or snap.get("latest_completed_market_session"),
         phase=snap.get("session_phase"),
         cairo=snap.get("cairo_time"),
         caption="Start here. Follow the next action, then return after ChatGPT replies or new market data arrives.",
     )
-    _primary_cta(code, snap, store, funnel_reg, db)
-    readiness_strip(_readiness_items(snap, code))
+    if snap.get("daily_bars_lagging"):
+        st.warning(snap.get("daily_session_note") or "Stored session closes lag the last completed EGX session.")
+        if snap.get("daily_refresh_checked"):
+            st.caption("The collection checked this session. You can continue with the available evidence; the ZIP will flag every remaining gap.")
+    elif snap.get("daily_provider") and snap.get("daily_provider") != "yahoo":
+        st.info(snap.get("daily_session_note") or f"Session closes use {snap.get('daily_provider')} (Yahoo may lag).")
+    elif snap.get("expected_session") and snap.get("price_session"):
+        st.caption(
+            f"Session close prices through **{snap.get('price_session')}** "
+            f"(expected last completed session **{snap.get('expected_session')}**)."
+        )
     st.markdown('<ol class="op-workflow" aria-label="Workflow overview">'
-        '<li><b>1. Scan the market</b><span>App · data and shortlist</span></li>'
-        '<li><b>2. Analyze in ChatGPT</b><span>You · send files and import replies</span></li>'
-        '<li><b>3. Review companies</b><span>ChatGPT · selective Funnel analysis</span></li>'
-        '<li><b>4. Track what happens</b><span>App · outcomes and weekly evidence</span></li></ol>', unsafe_allow_html=True)
+        '<li><b>1. Update data</b><span>Collect and scan all known equities</span></li>'
+        '<li><b>2. Prepare ZIP</b><span>Package the checked evidence</span></li>'
+        '<li><b>3. Use ChatGPT</b><span>Download, attach and analyze</span></li>'
+        '<li><b>4. Import reply</b><span>Save the reply and return here</span></li></ol>', unsafe_allow_html=True)
+    _primary_cta(code, snap, store, funnel_reg, db)
+    _download_details(snap)
+    readiness_strip(_readiness_items(snap, code))
     preview, results, tracking = st.tabs(["Candidate shortlist", "Imported analysis", "Outcome tracking"])
     with preview:
         if snap.get("candidate_count"):
             st.write(f"**{snap['candidate_count']} candidates** from the latest scan. Review the shortlist before sending it to ChatGPT.")
             rows = candidate_preview_rows(snap.get("candidates") or [], limit=5)
-            candidate_table([{k: row.get(k) for k in ("Rank", "Ticker", "Close", "Forward Setup", "RVOL20")} for row in rows], key="home_candidates")
+            candidate_table(
+                [{k: row.get(k) for k in ("Rank", "Ticker", "Session close", "Session", "Today", "Price source", "Forward Setup", "RVOL20")} for row in rows],
+                key="home_candidates",
+            )
             if st.button("Review all candidates", key="home_review_candidates"):
                 _go("Explorer Candidates")
         else:
@@ -143,32 +161,33 @@ def render_daily_operator(*, store=None, funnel_reg=None, db=None, root: Path | 
         if st.button("Open Forward Validation Lab", key="home_forward_lab"):
             _go("Forward Validation Lab")
 
-    with st.expander("Quick tools and data options", expanded=False):
-        st.caption("Run an individual task or adjust optional intraday data collection.")
+    with st.expander("Data details and manual refresh", expanded=False):
+        st.write(snap.get("daily_session_note") or "No collection yet.")
+        st.caption("A partial result can continue to a ZIP. Missing or stale companies stay flagged. Retry here when a provider has new data.")
+        if st.button("Retry data collection and scan", key="manual_refresh_data"):
+            _refresh_and_explorer(snap, store, funnel_reg, db)
+        report = snap.get("collection_report") or {}
+        supplemental = report.get("supplemental_market_snapshot") or {}
+        if supplemental.get("provider"):
+            st.write(f"**Additional source: EGXpilot** · {display_label(supplemental.get('status'))} · {supplemental.get('matched_equities', 0)} matched equities; {supplemental.get('quarantined', 0)} rows quarantined.")
+            st.caption(supplemental.get("note") or supplemental.get("error") or "Source unavailable.")
+        if report.get("results"):
+            st.dataframe(pd.DataFrame([
+                {k: row.get(k) for k in ("ticker", "data_state", "latest_session", "provider", "bars_stored", "error", "retry_after")}
+                for row in report["results"]
+            ]), hide_index=True, use_container_width=True)
         st.checkbox(
-            "Include TradingView (slow)",
+            "Include TradingView when running Broad Explorer from the steps list (slow)",
             key="enrich_tv_now",
             help=(
-                "Candidate ranks are computed from daily bars first. TradingView only attaches "
-                "confirmation candles afterwards. Skip it when the market is closed."
+                "Scan market never waits on TradingView intraday. Turn this on only if you run "
+                "Broad Explorer from the full workflow and want confirmation candles attached."
             ),
         )
-        if not live:
-            st.caption("Market is closed — leave TradingView off.")
-        q1, q2, q3, q4 = st.columns(4)
-        with q1:
-            if st.button("Refresh + Run Explorer", key="qa_refresh_explorer"):
-                _refresh_and_explorer(snap, store, funnel_reg, db)
-        with q2:
-            if st.button("Prepare Next-Session Package", key="qa_next_session"):
-                _prepare_next_session(snap, store, db)
-        with q3:
-            if st.button("Refresh Intraday", key="qa_intraday"):
-                _refresh_intraday(snap)
-        with q4:
-            if st.button("Update Outcomes", key="qa_outcomes"):
-                with st.spinner("Updating outcomes..."):
-                    _run(actions.update_outcomes(store=store, db=db))
+        if live:
+            st.caption("Market is open — use Today's Intraday for live bars. Keep Scan market daily-only.")
+        else:
+            st.caption("Market is closed — leave TradingView off unless you need a historical pull.")
 
     with st.expander("Full workflow · step details and manual actions", expanded=False):
         st.caption("Use this checklist to revisit a completed step or open a specific tool.")
@@ -193,6 +212,26 @@ def render_daily_operator(*, store=None, funnel_reg=None, db=None, root: Path | 
                 db.close()
             except Exception:
                 pass
+
+
+def _download_details(snap):
+    """Keep the package's evidence dates beside the download workflow."""
+    from egxbridge.analysis.common.data_stamp import display_cairo, stamp_caption
+    stamp = (snap.get("schedule") or {}).get("data_stamp") or {}
+    if not stamp:
+        return
+    if snap.get("package_outdated"):
+        st.warning("The saved ZIP is out of date. Follow the next action to rebuild it from the checked evidence.")
+    st.caption(stamp_caption(stamp))
+    coverage = stamp.get("daily_coverage") or {}
+    collection = stamp.get("daily_collection") or {}
+    st.write(
+        f"**Inside this ZIP:** {coverage.get('current', 0)} current, "
+        f"{coverage.get('stale', 0)} stale and {coverage.get('missing', 0)} missing equities "
+        f"for session **{coverage.get('expected_session') or 'unknown'}**. "
+        f"Collection finished {display_cairo(collection.get('finished_at'))}."
+    )
+    st.caption("Each company has its own source, data date and gap status in the ZIP. Preparing a file does not fetch new prices.")
 
 
 def _readiness_items(snap: dict[str, Any], *rest: Any) -> list[dict[str, Any]]:
@@ -262,6 +301,8 @@ def _import_result_form(snap: dict[str, Any], store):
 def _primary_cta(code: str | None, snap, store, funnel_reg, db):
     owner = "In ChatGPT · download the evidence here, then continue in ChatGPT" if code == ACTION_EXPORT_OR_IMPORT else "Waiting for market data" if code == ACTION_WAIT else "In this app"
     title = ACTION_LABELS.get(code or "", "Review your workflow")
+    if code == ACTION_WAIT and not snap.get("data_usable"):
+        title = "Waiting for usable provider data"
     do_now_panel(title=title if code == ACTION_WAIT else f"Next: {title}", steps=action_steps(code, snap), owner=owner)
     label = ACTION_CTA.get(code or "")
     if code == ACTION_WAIT or not label:
@@ -293,7 +334,7 @@ def _primary_cta(code: str | None, snap, store, funnel_reg, db):
         ):
             if st.button("Prepare next-session package", type="primary", key="cta_prep_for_export"):
                 _prepare_next_session(snap, store, db)
-        if st.button("I have ChatGPT replies · import them", key="cta_goto_import"):
+        if st.button("4. Import saved ChatGPT replies", key="cta_goto_import"):
             st.session_state["op_ready_to_import"] = True
             st.rerun()
         return
@@ -332,26 +373,25 @@ def _primary_cta(code: str | None, snap, store, funnel_reg, db):
 
 
 def _refresh_and_explorer(snap, store, funnel_reg, db):
+    """Scan market = daily collect (if needed) + Explorer. Never waits on TradingView intraday."""
     skip_yahoo = should_skip_market_refresh(snap)
-    use_tv = explorer_should_enrich_intraday(
-        snap.get("session_phase"), force=bool(st.session_state.get("enrich_tv_now")),
-    )
-    with st.status("Refresh + Run Explorer", expanded=True) as status:
+    with st.status("Updating data and scanning", expanded=True) as status:
         if skip_yahoo:
-            st.write("Using cached daily bars (market closed).")
+            st.write("Checking the company catalog and all daily coverage; current cached closes will be reused.")
+        elif snap.get("daily_bars_lagging"):
+            st.write("Refreshing daily bars (Yahoo, then TradingView if Yahoo lags)…")
         else:
-            st.write("Refreshing market data from Yahoo.")
-        if use_tv:
-            st.write("Scanning Explorer, then querying TradingView for 15 names (this can take several minutes).")
-        else:
-            st.write("Scanning Explorer from daily bars (TradingView skipped).")
+            st.write("Refreshing daily bars from Yahoo…")
+        st.write("Session closes use completed EGX sessions only (not today's unfinished bar).")
+        st.write("After this finishes, the next button prepares your ChatGPT ZIP. Optional intraday tools are in Full workflow below.")
         r = actions.refresh_and_run_explorer(
             snapshot=snap,
             store=store,
             db=db,
             funnel_registry=funnel_reg,
             root=HERE,
-            force_tv=bool(st.session_state.get("enrich_tv_now")),
+            force_tv=False,
+            enrich_intraday=False,
         )
         status.update(
             label="Completed" if r.get("ok") else "Did not complete",
@@ -361,13 +401,14 @@ def _refresh_and_explorer(snap, store, funnel_reg, db):
 
 
 def _run_explorer(snap, store, funnel_reg, db):
-    use_tv = explorer_should_enrich_intraday(
-        snap.get("session_phase"), force=bool(st.session_state.get("enrich_tv_now")),
+    # Broad Explorer from the step list stays daily-fast unless the operator opts into TV.
+    use_tv = bool(st.session_state.get("enrich_tv_now")) and explorer_should_enrich_intraday(
+        snap.get("session_phase"), force=True,
     )
     label = (
         "Scanning Explorer, then querying TradingView (this can take several minutes)..."
         if use_tv else
-        "Scanning Explorer from daily bars (TradingView skipped)..."
+        "Scanning Explorer from daily bars..."
     )
     with st.spinner(label):
         _run(actions.run_broad_explorer(
@@ -388,7 +429,7 @@ def _prepare_next_session(snap, store, db):
 
 
 def _refresh_intraday(snap):
-    with st.spinner("Refreshing Intraday evidence..."):
+    with st.spinner("Fetching today's TradingView intraday bars..."):
         r = actions.refresh_intraday(explorer_payload=snap.get("explorer", {}).get("payload"), root=HERE)
     if r.get("ok") and r.get("age_seconds") is not None:
         st.session_state["intraday_age_override"] = r.get("age_seconds")
@@ -402,18 +443,33 @@ def _step_box(n: int, title: str, status: str, focus: set[int]):
 
 def _step1_refresh(snap: dict[str, Any], focus: set[int], code: str | None):
     with _step_box(1, "Refresh Market Data", snap.get("market_data_status") or "NOT RUN", focus):
-        st.caption("Yahoo-only collect. Not required unless the next action calls for new data.")
+        st.caption(
+            "Yahoo first. If Yahoo daily bars lag the last completed EGX session, TradingView daily bars are fetched as fallback."
+        )
         st.caption(f"Last run: {snap.get('latest_collection_at') or snap.get('handoff_generated_at') or '—'}")
-        if snap.get("freshness") == "STALE_EXPECTED":
+        if snap.get("daily_bars_lagging"):
+            st.warning(snap.get("daily_session_note") or "")
+        elif snap.get("freshness") == "STALE_EXPECTED":
             st.info(snap.get("freshness_note") or "")
         elif snap.get("freshness") == "UNEXPECTED_STALE":
             st.warning(snap.get("freshness_note") or "")
         st.write(
+            f"Price session: **{snap.get('price_session') or snap.get('latest_completed_market_session') or '—'}**  ·  "
+            f"Expected: **{snap.get('expected_session') or '—'}**  ·  "
+            f"Source: **{snap.get('daily_provider') or '—'}**  ·  "
             f"Daily data: **{snap.get('daily_data_available') or 0}** / **{snap.get('equity_universe') or 0}**  ·  "
             f"Scanner eligible: **{snap.get('scanner_eligible') or 0}**  ·  "
             f"TradingView Intraday: **{snap.get('intraday_enriched') or 0}** / **{snap.get('intraday_requested') or 0}** requested  ·  "
             f"Freshness: **{snap.get('freshness')}**"
         )
+        report = snap.get("collection_report") or {}
+        if report:
+            with st.popover("Collection report — every company, state and time"):
+                st.caption(f"Scope: {report.get('scope')} · Started UTC: {report.get('started_at')} · Finished UTC: {report.get('finished_at')}")
+                st.caption("Catalog coverage is provider reported; official exchange completeness is unverified.")
+                rows = report.get("results") or []
+                st.dataframe(pd.DataFrame(rows).drop(columns=["attempts"], errors="ignore"), hide_index=True, use_container_width=True)
+                st.download_button("Download collection report (JSON)", data=json.dumps(report, ensure_ascii=False, indent=2), file_name="EGX_collection_report.json", mime="application/json", key="daily_collection_report_download")
         if snap.get("provider_summary"):
             st.caption("Providers: " + ", ".join(
                 f"{p.get('name')}={p.get('state')}" for p in snap.get("provider_summary") if p.get("name")
@@ -424,13 +480,21 @@ def _step1_refresh(snap: dict[str, Any], focus: set[int], code: str | None):
             b1, b2 = st.columns(2)
             with b1:
                 if st.button("Refresh Market Data", key="do_refresh"):
-                    with st.spinner("Refreshing market data..."):
-                        _run(actions.refresh_market_data(root=HERE))
+                    with st.spinner("Collecting daily bars for the EGX equity universe..."):
+                        _run(actions.refresh_market_data(root=HERE, force_tradingview_fallback=True))
             with b2:
+                if st.button("Collect all EGX equities", key="do_collect_all"):
+                    with st.spinner("Full EGX universe collect (Yahoo + TradingView fallback)..."):
+                        _run(actions.refresh_market_data(root=HERE, force_tradingview_fallback=True))
                 if st.button("View Provider Status", key="do_providers"):
                     _go("Provider Status")
         audit_expander("Advanced / Audit — market data", {
             "latest_completed_market_session": snap.get("latest_completed_market_session"),
+            "price_session": snap.get("price_session"),
+            "expected_session": snap.get("expected_session"),
+            "daily_bars_lagging": snap.get("daily_bars_lagging"),
+            "daily_provider": snap.get("daily_provider"),
+            "daily_session_note": snap.get("daily_session_note"),
             "handoff_status": snap.get("handoff_status"),
             "market_data_status": snap.get("market_data_status"),
             "provider_status": snap.get("provider_status"),
@@ -590,6 +654,17 @@ def _step5_export(snap, focus: set[int], code: str | None):
             f"{job_txt}  ·  "
             f"{sched.get('candidate_count') or snap.get('candidate_count') or '—'} candidates"
         )
+        from egxbridge.analysis.common.data_stamp import stamp_caption
+        cap = stamp_caption(sched.get("data_stamp") or snap.get("data_stamp"))
+        if cap:
+            st.caption(cap)
+        zip_packaged = ((sched.get("data_stamp") or {}).get("packaged_at_utc"))
+        intra_fetch = (snap.get("intraday_stamp") or {}).get("fetched_at_utc")
+        if zip_packaged and intra_fetch and str(intra_fetch) > str(zip_packaged):
+            st.warning(
+                "Today's Intraday was fetched after this ZIP was prepared. "
+                "Prepare ZIP again to include the new bars."
+            )
         if code == ACTION_EXPORT_OR_IMPORT:
             st.caption("Use the download in the next-action panel. That is the only file ChatGPT needs.")
         elif code == ACTION_IMPORT_CHATGPT:
@@ -716,7 +791,7 @@ def _step7_funnel(snap, funnel_reg, store, focus: set[int], code: str | None):
 def _step8_intraday(snap, store, db, focus: set[int], code: str | None):
     intra = snap.get("intraday") or {}
     with _step_box(8, "During the EGX Session", intra.get("status") or "NOT_LIVE", focus):
-        st.caption("Live confirmation is only available in continuous trading, and only with fresh bars.")
+        st.caption("Pull today's TradingView bars for the shortlist, then prepare the Intraday ChatGPT handoff.")
         st.info(intra.get("headline") or "")
         st.caption(
             "EGX Market Bridge does not execute orders and currently does not provide broker-grade bid/ask/depth. "
@@ -724,24 +799,36 @@ def _step8_intraday(snap, store, db, focus: set[int], code: str | None):
         )
         live = bool(intra.get("live"))
         age = snap.get("intraday_age_seconds")
+        istamp = snap.get("intraday_stamp") or {}
         st.write(
-            f"Latest Intraday age: **{format_age(age)}**  ·  "
-            f"Freshness: **{intra.get('status')}**  ·  "
+            f"Fetched at: **{istamp.get('fetched_at_cairo_display') or 'not refreshed yet'}**  ·  "
+            f"Newest TV bar: **{istamp.get('last_bar_cairo_display') or '—'}**  ·  "
+            f"Bar delay: **{format_age(istamp.get('last_bar_delay_seconds') if istamp.get('last_bar_delay_seconds') is not None else age)}**  ·  "
             f"ACTIONABLE: **{'YES' if intra.get('actionable') else 'NO'}**  ·  "
             f"Enriched: {snap.get('intraday_enriched') or 0} / {snap.get('intraday_requested') or 0}"
         )
+        st.caption(
+            "Today's Intraday downloads delayed TradingView candles. "
+            "Fetch time is when you pressed the button; bar time is the candle TradingView actually returned. "
+            "Those are not the same clock."
+        )
+        if live:
+            st.caption(
+                "Use **Refresh today's Intraday** to fetch 5m/1m/15m bars for the Explorer shortlist, "
+                "store them, and update the current Explorer package."
+            )
         if live and not intra.get("actionable"):
-            st.error("Intraday evidence is too stale for actionable confirmation. ACTIONABLE = NO.")
+            st.error("Intraday evidence is too stale for actionable confirmation. Refresh today's Intraday.")
         b1, b2 = st.columns(2)
         with b1:
             if code == ACTION_INTRADAY:
                 st.caption("Use the next action at the top of this page.")
-            elif st.button("Refresh Intraday Data", key="do_intra_ref"):
+            elif st.button("Refresh today's Intraday", key="do_intra_ref"):
                 _refresh_intraday(snap)
         with b2:
-            disable_prep = not snap.get("has_intraday_selected")
+            disable_prep = not (snap.get("has_intraday_selected") or snap.get("intraday_enriched") or live)
             if disable_prep:
-                st.caption("Prepare Intraday requires Intraday-selected candidates.")
+                st.caption("Prepare Intraday requires a shortlist. Run Explorer, then refresh today's bars.")
             if st.button("Prepare Intraday Handoff", key="do_intra_prep", disabled=disable_prep):
                 with st.spinner("Preparing Intraday ChatGPT handoff..."):
                     _run(actions.prepare_schedule_jobs(
@@ -755,6 +842,8 @@ def _step8_intraday(snap, store, db, focus: set[int], code: str | None):
             if panel:
                 st.dataframe(pd.DataFrame(panel), use_container_width=True, hide_index=True)
                 st.caption("ChatGPT states such as CONFIRMED are analysis labels, not automatic orders. Never CONFIRMED BUY.")
+            else:
+                st.caption("No intraday rows yet — click Refresh today's Intraday.")
         else:
             with st.expander("Historical Intraday review"):
                 panel = intraday_panel_rows(snap.get("candidates") or [], imports=snap.get("imports"))

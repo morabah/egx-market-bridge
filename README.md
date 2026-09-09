@@ -103,12 +103,34 @@ Or double-click `run_mac.command` / `run_windows.bat`.
 
 Start on **Daily Operator**. Its **Next** panel names the current action and explains whether to continue in the app or in ChatGPT.
 
-1. **Scan and review.** Run the suggested market scan, then open **Explorer Candidates** to search the shortlist and inspect a company. Extra filters and source details are available when needed.
-2. **Send evidence to ChatGPT.** Prepare and download the package. Attach the ZIP in ChatGPT, then save each analysis reply as `.md`, `.txt` or `.json`.
-3. **Import and review company analysis.** Import each saved reply on Daily Operator or **Schedule Analysis Center**. The form advances to the next missing job and clears the previous upload. For company valuation, use **Analysis Workflows** to prepare a Funnel stage, full analysis or eligible update, then import its reply there.
-4. **Track what happened.** After future market sessions, update outcomes and use **Signal Outcomes** or **Forward Validation Lab**. Select a trading-session horizon to compare matching returns and price excursions. Pending or unavailable outcomes remain missing, never zero.
+1. **Update data and scan.** This checks all known equities and builds the shortlist. A partial collection stays clearly marked and can continue to the next step.
+2. **Prepare ChatGPT ZIP.** The app checks the scan against the expected completed session and the latest collection before packaging it.
+3. **Download ZIP for ChatGPT.** Check the data date, coverage and collection time beside the download. Attach the ZIP in ChatGPT and save each analysis reply as `.md`, `.txt` or `.json`.
+4. **Import saved ChatGPT replies.** Import each reply on Daily Operator or **Schedule Analysis Center**. The form advances to the next missing job and clears the previous upload.
 
 The home page groups the shortlist, imported analysis and outcome tracking into tabs. The full workflow checklist, optional tools and technical diagnostics are collapsed until needed.
+
+Manual collection retries are under **Data details and manual refresh**. Finishing a partial collection does not keep sending you back to Scan. A newly completed session requires a new check; a newer scan, collection or intraday refresh makes the old ZIP out of date. Company Funnel analysis and future outcome tracking remain available in the full workflow.
+
+Daily collection stops starting provider requests after a five-minute budget; requests already in flight finish under their provider timeouts. Every skipped company remains in the report as a data gap.
+
+The [EGXpilot public bulk API](https://www.egxpilot.com/developers.html) adds a supplementary market snapshot with one request per collection, bounded timeout and no automatic retry. It is included in `common/supplemental_market_snapshot.json`. Per-record `CreatedAt` is preserved separately from batch `updatedAt` and collection time. It is not a verified exchange trade timestamp. Inconsistent OHLC or percentage changes, missing/future timestamps and duplicate symbols are quarantined. These snapshots never replace daily candles, history or scanner scores. Set `enabled_providers.egxpilot` to `false` to disable the source. Licensed [EGID](https://ticker.egidegypt.com/index.html) remains supported; the live check returned HTTP 401 without a licensed token.
+
+## Collection coverage and download status
+
+**Scan market** reconciles the full known equity catalog before collecting daily data. Discovery merges the public TradingView EGX catalog, configured Borsa/import sources, the reference registry, configuration and stored symbols. Successful discovery is cached for 24 hours; failures retain the last-good catalog and wait 15 minutes before another automatic attempt. `python collect.py --refresh-universe` explicitly refreshes discovery. Catalog refresh is a single bounded request per source; truncated TradingView catalogs are rejected.
+
+Known equities remain visible when prices are missing. Retained historical names are not assumed active, and provider catalogs do not establish official exchange completeness. Indices, funds and other known non-equities remain listed with their exclusions. The configured session calendar still excludes Friday/Saturday but does not know exchange holidays.
+
+Daily freshness compares each company with the expected completed session. In-progress bars are not final closes. History counts distinct sessions from the selected provider; short histories receive a full history request, while sufficient histories use an overlap window. Current sufficient histories are reused. Recent provider corrections are audited and applied; older captures cannot overwrite newer ones.
+
+Transient daily failures get at most two attempts per provider, with rate limiting and separate provider circuits. Missing symbols are not immediately retried and do not disable collection for other companies. Stale/failed requests have a 15-minute retry cooldown, recorded as `retry_after`; a new expected session or explicit `--refresh` bypasses it. SQLite workers use separate connections and commit each returned batch together. TradingView socket history requests are serialized and close after a 30-second deadline, including streams that only emit heartbeats.
+
+The **Collection report** on Daily Operator lists every requested company, status, source, history range, collection start/end, original data capture time, request attempts and errors. Its JSON is saved beside the market database as `daily_collection_report.json`. Cache reuse preserves original data timestamps. Failures and partial coverage are reported rather than labeled a successful full refresh.
+
+Every new evidence ZIP includes `DATA_STAMP.json` and `DATA_STAMP.md`, with daily coverage and per-company sessions/capture times. Downloads show contents, file size, package time, data state and intraday age at download time. The newest bar's delay is measured against package time, separately from fetch time. Preparing a schedule ZIP packages existing evidence; use the explicit Intraday refresh to obtain newer candles. Downloading an existing ZIP preserves its original evidence and timestamps. ZIP replacement is atomic.
+
+The plain collector CLI remains an explicitly continuous mode until Ctrl+C, with the configured pause **after** each run; `--once` exits after one run. `session_only` is honored in continuous mode. The dashboard performs collection on request; it does not promise a continuously live feed.
 
 ## Configure
 
@@ -155,3 +177,54 @@ pytest -m integration
 ## Privacy / safety
 
 Read-only. No broker automation. No order placement. No embedded passwords.
+# Daily data and download audit corrections
+
+Overnight intraday collection retains valid bars from earlier sessions and marks
+them historical. The default request set is 1m, 5m and 15m, with at most one
+immediate retry for transient failures. Empty responses and rate limits receive
+no immediate retry. Per-bar provider and capture timestamps survive export.
+
+OHLC prices must be finite, positive and consistent with their high/low bounds;
+volume must be nonnegative when supplied. Invalid source corrections cannot
+overwrite good cached rows. Rejected observations stay in the audit exports,
+and indicators use the continuous valid history after the last rejected session.
+This validates the collector's OHLCV contract; it does not independently certify
+exchange prices or reconcile different upstream price conventions.
+
+Daily bars qualify as completed only when their capture timestamp proves they were
+collected after that session closed. Legacy pre-close captures remain provisional
+until refetched, even on later days. Missing capture provenance is unconfirmed
+unless the source explicitly marked the bar final. The latest completed session
+uses the configured Cairo market hours; an official holiday calendar is still unavailable.
+
+The current scanner and market breadth require the expected completed session and
+enough history from one provider. All other known companies remain in the exported
+registry with stale, missing, or insufficient-history reasons. Provider selection
+uses the freshest completed session, then history length, with Yahoo breaking ties.
+
+Downloads include the collection report, its start/end times, actual network
+attempts and cache/deferred results, every selected intraday target's diagnostics,
+and available completed daily histories. Reports are frozen from the same database
+at package creation; packaging makes no network requests. Intraday `NOT_REQUESTED`
+and circuit `SKIPPED` outcomes are separate from attempted failures. Cached bars
+keep their source dates and do not become current movers through repackaging.
+
+Custom-output and nonproduction Explorer runs keep their ZIPs outside the production
+download directory and do not publish the dashboard's latest-run pointer. The dashboard
+selects the newest production snapshot by generation time, including scans with zero
+candidates; acceptance packages are never a fallback. Schedule exports and intraday
+refreshes recheck daily evidence, expected session, reconciled eligibility, and newer
+collection reports. If needed, they rebuild the Explorer snapshot once from the local
+database before proceeding. This rebuild does not fetch market data. A database is
+required to repair missing or outdated evidence.
+
+Combined downloads include daily source bars, rejected observations, per-company
+daily status and the frozen collection report. Cached ticker summaries select the
+newest source timestamp across intervals. Cache availability does not reset the
+timeout/rate-limit circuit breaker, and interval diagnostics preserve each provider's
+attempt count, outcome and start/end attempt timestamps.
+
+Single-candle high, low and volume are exported as bar fields. Session-volume
+summaries use one session and deduplicated bar volumes, disclose the observed
+window, and leave unknown or cumulative volume unaggregated. Full-session coverage
+and official exchange listing completeness are not inferred from the local cache.

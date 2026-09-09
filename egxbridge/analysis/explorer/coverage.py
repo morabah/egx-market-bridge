@@ -58,24 +58,25 @@ def classify_explorer_coverage(
     else:
         bias = "HIGH"
 
-    market_wide_confidence = coverage != "INSUFFICIENT"
     return {
         "mapped_coverage_pct": mapped_coverage_pct,
         "daily_data_coverage_pct": daily_data_coverage_pct,
         "scanner_eligible_coverage_pct": scanner_eligible_coverage_pct,
         "eligible_coverage_pct": eligible_coverage_pct,
         "EXPLORER_COVERAGE": coverage,
+        "exploratory_coverage_quality": coverage,
         "selection_basis": selection_basis,
         "selection_bias_risk": bias,
-        "market_wide_confidence_allowed": market_wide_confidence,
+        "market_wide_confidence_allowed": False,
+        "whole_egx_claim_allowed": False,
         "coverage_thresholds": th,
         "equity_universe_total": eq,
         "mapped_symbols": int(mapped_symbols or 0),
         "daily_data_available": int(daily_data_available or 0),
         "scanner_eligible": int(scanner_eligible or 0),
         "note": (
-            "Do not present market-wide conclusions when EXPLORER_COVERAGE=INSUFFICIENT"
-            if not market_wide_confidence
-            else "Coverage supports universe-level Explorer interpretation with stated bias risk"
+            "exploratory_coverage_quality is a scanner-eligibility ratio. "
+            "It does not authorize whole-EGX or market-wide claims. "
+            "whole_egx_claim_allowed requires explicit universe identity reconciliation."
         ),
     }

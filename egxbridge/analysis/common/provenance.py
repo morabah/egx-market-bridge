@@ -14,6 +14,7 @@ from egxbridge.analysis.common.candle_export import (
     NORMALIZED,
     LEGACY_UNNORMALIZED,
 )
+from egxbridge.daily_bars import select_daily_pool, session_of, daily_session_status
 from egxbridge.quality import score_symbol
 
 
@@ -34,17 +35,14 @@ def _dq_grade(score: float | None, *, execution: bool = False, execution_grade: 
 
 
 def _latest_completed_session(daily_enriched: list[dict[str, Any]]) -> str | None:
-    """Prefer Yahoo (or any) daily session_date from NORMALIZED rows only."""
+    """Newest completed session across providers (single-provider pool selected upstream)."""
     safe = [
         r for r in daily_enriched
-        if r.get("timestamp_normalization_status") == NORMALIZED and r.get("session_date")
+        if r.get("timestamp_normalization_status") == NORMALIZED and session_of(r)
     ]
     if not safe:
         return None
-    # Prefer yahoo when present
-    yahoo = [r for r in safe if (r.get("provider") or "").lower() == "yahoo"]
-    pool = yahoo or safe
-    return max(r["session_date"] for r in pool)
+    return max(session_of(r) for r in safe)
 
 
 def _classify_stored_quote(q: dict[str, Any]) -> dict[str, Any]:
@@ -110,7 +108,7 @@ def _classify_stored_quote(q: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def bridge_market_evidence(db, symbol: str) -> dict[str, Any]:
+def bridge_market_evidence(db, symbol: str, *, as_of=None) -> dict[str, Any]:
     """Gather deterministic Bridge evidence. Never fabricate fundamentals/fair value."""
     symbol = symbol.upper()
     out: dict[str, Any] = {
@@ -135,14 +133,15 @@ def bridge_market_evidence(db, symbol: str) -> dict[str, Any]:
         return out
 
     quotes = db.fetch_latest_quotes(symbol)
-    daily_raw = db.fetch_candles(symbol, "1d", limit=200)
+    daily_raw = db.fetch_candles(symbol, "1d", limit=5000)
+    pool_raw, daily_provider, daily_note = select_daily_pool(daily_raw, as_of=as_of)
     intraday_raw: list[dict[str, Any]] = []
     for iv in ("5m", "15m", "1h"):
         rows = db.fetch_candles(symbol, iv, limit=100)
         if rows:
             intraday_raw.extend([{**r, "interval": iv} for r in rows])
 
-    daily = enrich_candles([{**r, "interval": r.get("interval") or "1d"} for r in daily_raw])
+    daily = enrich_candles([{**r, "interval": r.get("interval") or "1d"} for r in pool_raw])
     intraday = enrich_candles(intraday_raw)
     daily_timing = timing_safe_candles(daily)
     intraday_timing = timing_safe_candles(intraday)
@@ -151,6 +150,8 @@ def bridge_market_evidence(db, symbol: str) -> dict[str, Any]:
     out["quote"] = q or None
     close_src = daily_timing[-1] if daily_timing else (daily[-1] if daily else None)
     out["latest_close"] = q.get("last") if q else (close_src.get("close") if close_src else None)
+    out["daily_provider"] = daily_provider
+    out["daily_provider_note"] = daily_note
 
     latest_session = _latest_completed_session(daily)
     if q:
@@ -207,6 +208,12 @@ def bridge_market_evidence(db, symbol: str) -> dict[str, Any]:
     if latest_session:
         metrics["session_date"] = latest_session
         metrics["latest_completed_market_session"] = latest_session
+    metrics["daily_provider"] = daily_provider
+    metrics["daily_provider_note"] = daily_note
+    daily_status = daily_session_status(daily, as_of=as_of)
+    metrics["expected_session"] = daily_status["expected_session"]
+    metrics["daily_bars_lagging"] = daily_status["lagging"]
+    metrics["prev_close"] = daily_timing[-2].get("close") if len(daily_timing) > 1 else None
     out["scanner_metrics"] = metrics
 
     has_price = out["latest_close"] is not None

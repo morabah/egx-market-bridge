@@ -187,6 +187,14 @@ div[data-testid="stExpander"] summary {
   padding: 0.95rem 1rem 0.7rem;
   margin: 1.1rem 0 0.45rem 0;
 }
+.op-shortcut-label {
+  margin: 0.85rem 0 0.35rem 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8A96A3;
+  font-weight: 600;
+}
 .op-cta .op-cta-title {
   font-size: 1.2rem;
   margin: 0 0 0.35rem 0;

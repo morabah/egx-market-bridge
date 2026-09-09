@@ -85,6 +85,7 @@ class ExplorerRunConfig:
     lane_c_slots: int = 8
     lane_d_slots: int = 4
     lane_e_slots: int = 4
+    recovery_limit: int = 10
     # Intraday enrichment representation (does not change ranking scores).
     intraday_lane_a_slots: int = 8
     intraday_lane_b_slots: int = 2

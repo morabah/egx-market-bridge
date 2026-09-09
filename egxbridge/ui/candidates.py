@@ -25,10 +25,25 @@ def candidate_preview_rows(candidates: list[dict[str, Any]], *, limit: int | Non
     rows = []
     for c in candidates or []:
         m = c.get("metrics") if isinstance(c.get("metrics"), dict) else {}
+        sess = (
+            c.get("latest_session")
+            or c.get("session_date")
+            or m.get("latest_session")
+            or m.get("session_date")
+            or ""
+        )
+        intra = c.get("intraday") if isinstance(c.get("intraday"), dict) else {}
+        today_px = _num(
+            intra.get("current_session_price")
+            or (intra.get("last_price") if intra.get("current_session") else None)
+        )
         rows.append({
             "Rank": c.get("calibrated_rank") or c.get("legacy_rank"),
             "Ticker": c.get("ticker"),
-            "Close": _num(c.get("last_close") or c.get("latest_close") or m.get("last_close")),
+            "Session close": _num(c.get("last_close") or c.get("latest_close") or m.get("last_close")),
+            "Session": str(sess)[:10] if sess else None,
+            "Today": today_px,
+            "Price source": c.get("daily_provider") or m.get("daily_provider") or None,
             "Forward Setup": c.get("FORWARD_SETUP_QUALITY"),
             "Move Already Realized": c.get("MOVE_ALREADY_REALIZED"),
             "Lane": c.get("candidate_lane"),
@@ -38,7 +53,7 @@ def candidate_preview_rows(candidates: list[dict[str, Any]], *, limit: int | Non
             ),
             "Volatility Risk": c.get("VOLATILITY_RISK"),
             "Funnel Status": c.get("funnel_status"),
-            "Intraday Available": bool(c.get("intraday_available")),
+            "Intraday Available": bool(c.get("intraday_available") or intra.get("intraday_available")),
             "Candidate Score": _num(c.get("candidate_score_calibrated") or c.get("candidate_score")),
         })
     if sort_by_rank:
@@ -168,8 +183,19 @@ def intraday_panel_rows(
         t = str(c.get("ticker") or "").upper()
         rows.append({
             "Ticker": t,
-            "Current/Latest Price": c.get("last_close") or c.get("latest_close"),
-            "Latest Candle Time": intra.get("captured_at") or intra.get("queried_at") or intra.get("timestamp"),
+            "Current/Latest Price": (
+                intra.get("current_session_price")
+                or intra.get("last_price")
+                or c.get("last_close")
+                or c.get("latest_close")
+            ),
+            "Intraday session": intra.get("session_date"),
+            "Latest Candle Time": (
+                intra.get("normalized_cairo_timestamp")
+                or intra.get("captured_at")
+                or intra.get("queried_at")
+                or intra.get("timestamp")
+            ),
             "Freshness": intra.get("freshness"),
             "Forward Setup": c.get("FORWARD_SETUP_QUALITY"),
             "Lane": c.get("candidate_lane"),

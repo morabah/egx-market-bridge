@@ -2,12 +2,21 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import tempfile
 import pandas as pd
 
 
 def jdump(path: Path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    payload = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+        temporary = Path(tmp.name)
+        try:
+            tmp.write(payload)
+            tmp.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def rows_to_csv(path: Path, rows: list[dict]):

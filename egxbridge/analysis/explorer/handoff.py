@@ -8,16 +8,34 @@ import shutil
 from egxbridge import __version__ as BRIDGE_VERSION
 from egxbridge.analysis import WORKFLOW_VERSION
 from egxbridge.analysis.common.ai_mode import AI_CHATGPT_HANDOFF, assert_handoff_only
-from egxbridge.analysis.common.environment import PRODUCTION, normalize_environment, workspace_root_for
+from egxbridge.analysis.explorer.universe_state import (
+    build_universe_coverage, eligibility_state, identity_row, ensure_canonical_identities,
+)
+from egxbridge.analysis.explorer.session_screen import (
+    cheap_snapshot, recover_missing_tickers, overlay_session_quotes,
+    session_quotes_from_db, merge_recovery_into_enrich,
+)
+from egxbridge.analysis.explorer.intraday import enrich_shortlist_intraday
+from egxbridge.analysis.explorer.intraday_fetch import apply_provider_state_to_coverage
+from egxbridge.analysis.common.environment import PRODUCTION, UNIT_TEST, normalize_environment, workspace_root_for
 from egxbridge.analysis.common.models import HandoffManifest, utc_now
-from egxbridge.analysis.common.packaging import write_json, write_text, zip_directory, finalize_manifest
+from egxbridge.analysis.common.data_stamp import (
+    build_data_stamp,
+    parse_dt,
+    dated_zip_name,
+    stamp_markdown,
+    write_package_stamp,
+    write_zip_sidecar,
+)
+from egxbridge.analysis.common.packaging import write_json, write_text, zip_directory, finalize_manifest, write_jsonl
+from egxbridge.analysis.explorer.session_volume import unavailable_book, unavailable_tape
+from egxbridge.symbols import canonicalize_any, load_name_aliases
 from egxbridge.analysis.common.provenance import bridge_market_evidence
 from egxbridge.analysis.common.persistence import AnalysisStore
 from egxbridge.analysis.explorer.models import ExplorerRunConfig
 from egxbridge.analysis.explorer.candidate_context import build_candidate_row
 from egxbridge.analysis.explorer.universe import build_explorer_universe
 from egxbridge.analysis.explorer.coverage import classify_explorer_coverage
-from egxbridge.analysis.explorer.intraday import enrich_shortlist_intraday
 from egxbridge.analysis.explorer.prescreen import (
     normalize_scanner_metrics,
     score_candidates,
@@ -79,17 +97,19 @@ What changed since the last completed session that could affect **specific stock
 - Historical 3M/6M return alone is not a next-session catalyst.
 - DELAYED_REPRICING_TECHNICAL_HYPOTHESIS requires an external catalyst check; the local bridge has no news feed.
 """,
-    "intraday_scanner.md": """# C) Intraday Scanner — confirmation for pre-screen candidates
+    "intraday_scanner.md": """# C) Intraday Scanner — confirmation for pre-screen and recovered names
 
 Question:
-Which **pre-screen candidates** require live/session confirmation?
+Which **pre-screen candidates and recovered current movers** require live/session confirmation?
 
-- Use `intraday_enrichment.csv` (TradingView shortlist only). Missing intervals do not fail a candidate.
+- Use `intraday_enrichment.csv` plus `intraday_1m.jsonl` / `intraday_5m.jsonl` / `intraday_15m.jsonl` for raw OHLCV **including volume**.
+- `universe_coverage.json` is the completeness gate. Do not claim WHOLE_EGX unless `whole_egx_claim_allowed` is true.
+- `missing_ticker_recovery_log.json` lists names that were absent from the prior shortlist but recovered from current activity.
+- Missing intervals do not fail a candidate. Missing tape/depth is explicit (`SOURCE_UNAVAILABLE`) — do not infer order flow.
 - Highest quantitative score ≠ best trade. `forward_setup_score` is HEURISTIC_UNCALIBRATED, not a probability.
-- Inspect forward_setup_components, breakout/pre-breakout state, VOLATILITY_RISK, and confirmation needed.
-- Do not infer order flow, absorption, or distribution from daily or incomplete intraday candles.
+- Inspect forward_setup_components, breakout/pre-breakout state, VOLATILITY_RISK, session_volume, and confirmation needed.
 - Respect `execution_grade=NO` when depth/trades/bid-ask are absent.
-- High RVOL is not automatically bullish — read `rvol_context` (direction, distance from high, volatility).
+- High RVOL is not automatically bullish — read `rvol_context` and same-time RVOL when present.
 - Output WATCH / WAIT_FOR_CONFIRMATION / AVOID-style next-session notes — not BUY/SELL orders.
 - The local bridge does not emit an exact Do-Not-Chase price. Use extension_context, ATR distance, and MOVE_ALREADY_REALIZED with news/psychology.
 """,
@@ -198,18 +218,22 @@ def prepare_explorer_handoff(
     environment = normalize_environment(getattr(config, "environment", None) or getattr(store, "environment", None) or PRODUCTION)
     funnel_registry = _funnel_registry_for(store, db, funnel_registry, environment)
 
+    generated_at = utc_now()
+    as_of = parse_dt(generated_at)
     uni = build_explorer_universe(
         db, explicit=config.universe or None, min_scanner_bars=getattr(config, "min_scanner_bars", 20),
+        as_of=as_of,
     )
     tickers = list(uni.get("DISCOVERY_SYMBOLS") or uni.get("all_symbols") or uni.get("MAPPED_SYMBOLS") or [])
     config.universe = tickers
 
-    generated_at = utc_now()
     date_tag = (config.target_date or generated_at[:10])
-    dated = date_tag.replace("-", "")
     defaulted = output_root is None
+    output_base = HERE / "output"
+    if environment != PRODUCTION:
+        output_base = output_base / environment.lower()
     if output_root is None:
-        out_root = HERE / "output" / "explorer_handoff" / date_tag
+        out_root = output_base / "explorer_handoff" / date_tag
     else:
         out_root = Path(output_root)
     if out_root.exists():
@@ -237,7 +261,6 @@ def prepare_explorer_handoff(
         "CURRENT": 0, "NEEDS_DELTA": 0, "STALE": 0, "NOT_FOUND": 0,
         "PARTIAL": 0, "REQUIRES_CONTINUATION": 0, "NOT_RELIABLE": 0,
     }
-    latest_sessions: list[str] = []
     rdq_scores: list[float] = []
     exec_grades: list[str] = []
 
@@ -271,6 +294,8 @@ def prepare_explorer_handoff(
             "exclusion_reason": reason,
             "daily_bars": st.get("daily_bars"),
             "latest_session": st.get("latest_session"),
+            "expected_session": st.get("expected_session"),
+            "daily_bars_lagging": st.get("daily_bars_lagging"),
             "source": getattr(rec, "source", "") if rec else uni.get("universe_source"),
         })
 
@@ -300,14 +325,12 @@ def prepare_explorer_handoff(
             })
             continue
 
-        evidence = bridge_market_evidence(db, t) if db is not None else {}
+        evidence = bridge_market_evidence(db, t, as_of=as_of) if db is not None else {}
         metrics = enrich_metrics_fields(
             normalize_scanner_metrics(evidence.get("scanner_metrics") or {}),
             latest_session=evidence.get("latest_completed_market_session") or st.get("latest_session"),
         )
         sess = evidence.get("latest_completed_market_session") or evidence.get("session_date") or st.get("latest_session")
-        if sess:
-            latest_sessions.append(sess)
         if evidence.get("research_data_quality_score") is not None:
             try:
                 rdq_scores.append(float(evidence["research_data_quality_score"]))
@@ -343,6 +366,7 @@ def prepare_explorer_handoff(
         scanner_rows.append({
             "ticker": t,
             "metrics": metrics,
+            "quote": evidence.get("quote") or {},
             "funnel_ctx": fctx,
             "market_source_evidence": {k: evidence.get(k) for k in (
                 "providers_used", "research_data_quality_score", "research_data_quality_grade",
@@ -408,25 +432,108 @@ def prepare_explorer_handoff(
     )
     enrich_tickers = [s["ticker"] for s in enrich_sel]
     enrich_meta = {s["ticker"]: s for s in enrich_sel}
-    intraday_pack = {"queried_tickers": [], "rows": [], "failures": [], "by_ticker": {}, "intraday_enriched": 0}
-    if getattr(config, "enrich_intraday", True) and enrich_tickers:
-        tv = tradingview
-        if tv is None:
-            try:
-                from egxbridge.config import Settings
-                from egxbridge.symbols import SymbolRegistry
-                from egxbridge.providers.tradingview import TradingViewProvider
-                settings = Settings.load(HERE / "config.json")
-                registry = SymbolRegistry.from_config({"symbol_aliases": settings.symbol_aliases})
-                tv = TradingViewProvider(
-                    registry,
-                    enabled=bool((settings.enabled_providers or {}).get("tradingview", True)),
-                    username=settings.tradingview_username,
-                    password=settings.tradingview_password,
-                )
-            except Exception:
-                tv = None
-        intraday_pack = enrich_shortlist_intraday(enrich_tickers, tv=tv)
+
+    name_aliases = load_name_aliases()
+    universe_identity = []
+    for t, st in (status_by or {}).items():
+        rec = records.get(t)
+        aliases = [a for a in (st.get("aliases") or []) if a]
+        for extra in name_aliases.get(str(t).upper(), []):
+            if extra not in aliases:
+                aliases.append(extra)
+        universe_identity.append(identity_row(
+            canonical_ticker=t,
+            security_id=st.get("security_id") or t,
+            current_name=st.get("current_name") or (getattr(rec, "display_name_if_known", "") if rec else ""),
+            aliases=aliases,
+            instrument_type=st.get("instrument_type") or st.get("security_type") or EQUITY,
+            data_status=st.get("data_status"),
+            eligibility_reason=st.get("eligibility_reason") or st.get("exclusion_reason"),
+        ))
+        universe_identity[-1]["eligibility_state"] = eligibility_state(
+            st.get("data_status"), security_type=st.get("security_type"),
+        )
+        universe_identity[-1]["universe_state"] = universe_identity[-1]["eligibility_state"]
+    universe_identity = ensure_canonical_identities(
+        universe_identity,
+        name_aliases=name_aliases,
+        expected_tickers=list(status_by or {}),
+    )
+    universe_coverage = build_universe_coverage(
+        universe_identity,
+        expected_equities=int(uni.get("EQUITY_UNIVERSE_TOTAL") or 0) or None,
+    )
+    snapshots = {}
+    for row in scanner_rows:
+        t = str(row.get("ticker") or "").upper()
+        snapshots[t] = cheap_snapshot(
+            t,
+            metrics=row.get("metrics") or {},
+            quote=row.get("quote") or {},
+            retrieval_timestamp=generated_at,
+        )
+    eligible_for_session = list(uni.get("SCANNER_ELIGIBLE_SYMBOLS") or [r["ticker"] for r in scanner_rows])
+    snapshots = overlay_session_quotes(
+        snapshots,
+        session_quotes_from_db(db, eligible_for_session, cutoff=generated_at),
+        retrieval_timestamp=generated_at,
+    )
+    recovery_limit = int(getattr(config, "recovery_limit", 10) or 10)
+    recovery_log = recover_missing_tickers(
+        all_scored,
+        shortlist_tickers={c["ticker"] for c in prescreen_all},
+        snapshots=snapshots,
+        limit=recovery_limit,
+        retrieval_timestamp=generated_at,
+    )
+    recovered_tickers = [r["ticker"] for r in recovery_log if r.get("recovered")]
+    enrich_tickers = merge_recovery_into_enrich(enrich_tickers, recovery_log)
+    for t in recovered_tickers:
+        if t not in enrich_meta:
+            enrich_meta[t] = {
+                "ticker": t,
+                "intraday_selection_reason": "RECOVERED_CURRENT_MOVER",
+                "intraday_selection_lane": "RECOVERY",
+                "intraday_selection_rank_within_lane": None,
+            }
+
+    live_fetch = bool(getattr(config, "enrich_intraday", False)) and environment != UNIT_TEST
+    tv = tradingview
+    if live_fetch and tv is None:
+        try:
+            from egxbridge.config import Settings
+            from egxbridge.symbols import SymbolRegistry
+            from egxbridge.providers.tradingview import TradingViewProvider
+            settings = Settings.load(HERE / "config.json")
+            registry = SymbolRegistry.from_config({"symbol_aliases": settings.symbol_aliases})
+            tv = TradingViewProvider(
+                registry,
+                enabled=bool((settings.enabled_providers or {}).get("tradingview", True)),
+                username=settings.tradingview_username,
+                password=settings.tradingview_password,
+                request_timeout=int(settings.request_timeout_seconds or 20),
+            )
+        except Exception:
+            tv = None
+    try:
+        intraday_pack = enrich_shortlist_intraday(
+            enrich_tickers, tv=tv, db=db, store_candles=True, n_bars=180, keep_ohlcv=True,
+            live_fetch=live_fetch, allow_yahoo_fallback=live_fetch,
+        )
+    except TypeError:
+        intraday_pack = enrich_shortlist_intraday(
+            enrich_tickers, tv=tv, db=db, store_candles=True, n_bars=180,
+        )
+    fetch_diag = intraday_pack.get("intraday_fetch_diagnostics") or {}
+    universe_coverage = apply_provider_state_to_coverage(universe_coverage, fetch_diag)
+    coverage = {
+        **coverage,
+        "exploratory_coverage_quality": coverage.get("exploratory_coverage_quality") or coverage.get("EXPLORER_COVERAGE"),
+        "whole_egx_claim_allowed": bool(universe_coverage.get("whole_egx_claim_allowed")),
+        "market_wide_confidence_allowed": bool(universe_coverage.get("whole_egx_claim_allowed")),
+        "run_scope": universe_coverage.get("run_scope") or coverage.get("selection_basis"),
+        "intraday_provider_state": fetch_diag.get("provider_state"),
+    }
 
     handoff_shortlist = prescreen_all[:handoff_limit]
     candidate_metrics = []
@@ -476,6 +583,10 @@ def prepare_explorer_handoff(
             "intraday_selection_reason": (enrich_meta.get(t) or {}).get("intraday_selection_reason"),
             "intraday_selection_lane": (enrich_meta.get(t) or {}).get("intraday_selection_lane"),
             "intraday_selection_rank_within_lane": (enrich_meta.get(t) or {}).get("intraday_selection_rank_within_lane"),
+            "canonical_ticker": canonicalize_any(t),
+            "security_id": t,
+            "recovery_state": None,
+            "eligibility_state": "COVERED",
         }
         row = build_candidate_row(
             t, metrics, fctx,
@@ -490,17 +601,128 @@ def prepare_explorer_handoff(
         )
         row["prescreen_score"] = item.get("prescreen_score")
         row["intraday"] = (intraday_pack.get("by_ticker") or {}).get(t) or {
-            "ticker": t, "intraday_available": False, "intervals": [],
+            "ticker": t, "intraday_available": False, "intervals": [], "ohlcv": {},
+            "intraday_fetch_state": "UNKNOWN_FAILURE",
+            "error_class": "NOT_IN_FETCH_PACK",
         }
         row["intraday_available"] = bool(row["intraday"].get("intraday_available"))
+        row["intraday_fetch_state"] = row["intraday"].get("intraday_fetch_state")
+        row["intraday_cache_status"] = row["intraday"].get("cache_status") or row["intraday"].get("status")
+        row["canonical_ticker"] = canonicalize_any(t)
+        row["eligibility_state"] = "COVERED"
+        row["session_volume"] = (row.get("intraday") or {}).get("session_volume")
+        row["depth"] = (row.get("intraday") or {}).get("depth") or unavailable_book()
+        row["trades"] = (row.get("intraday") or {}).get("trades") or unavailable_tape()
+        row["session_snapshot"] = snapshots.get(t)
         if fctx.get("funnel_status") == "NOT_FOUND":
             row["fair_value_from_funnel_only"] = None
             row["funnel_context"]["Fair Value Range"] = None
             row["fair_value_manufactured"] = False
         candidate_metrics.append(row)
 
+    present = {str(c.get("ticker") or "").upper() for c in candidate_metrics}
+    scored_by = {str(c.get("ticker") or "").upper(): c for c in all_scored}
+    for recov in recovery_log:
+        t = recov["ticker"]
+        if t in present:
+            for c in candidate_metrics:
+                if str(c.get("ticker") or "").upper() == t:
+                    c["recovery_state"] = recov.get("downstream_state")
+                    c["missing_ticker_recovery"] = recov
+            continue
+        item = scored_by.get(t)
+        if not item:
+            continue
+        fctx = item.get("funnel_ctx") or {"ticker": t, "funnel_status": "NOT_FOUND"}
+        metrics = item.get("metrics") or {}
+        struct = item.get("structure") or {}
+        rank_row = ranked_by_ticker.get(t) or {}
+        row = build_candidate_row(
+            t, metrics, fctx,
+            selection_basis="PARTIAL_UNIVERSE",
+            selection_bias_risk=selection_bias_risk,
+            candidate_reasons=item.get("candidate_reasons"),
+            candidate_families=item.get("candidate_families"),
+            candidate_warnings=list(item.get("candidate_warnings") or []) + ["RECOVERED_CURRENT_MOVER"],
+            data_status="SCANNER_ELIGIBLE",
+            candidate_score=item.get("candidate_score_calibrated") or item.get("candidate_score"),
+            extra={
+                "candidate_score_legacy": item.get("candidate_score_legacy"),
+                "candidate_score_calibrated": item.get("candidate_score_calibrated"),
+                "MOVE_ALREADY_REALIZED": item.get("MOVE_ALREADY_REALIZED"),
+                "FORWARD_SETUP_QUALITY": item.get("FORWARD_SETUP_QUALITY"),
+                "forward_setup_score": item.get("forward_setup_score"),
+                "candidate_lane": item.get("candidate_lane"),
+                "TECHNICAL_HISTORY_INTEGRITY": item.get("TECHNICAL_HISTORY_INTEGRITY"),
+                "VOLATILITY_RISK": item.get("VOLATILITY_RISK"),
+                "structure": struct,
+                "legacy_rank": rank_row.get("legacy_rank"),
+                "calibrated_rank": rank_row.get("calibrated_rank"),
+                "scoring_version": SCORING_VERSION,
+                "intraday_selection_reason": "RECOVERED_CURRENT_MOVER",
+                "intraday_selection_lane": "RECOVERY",
+                "canonical_ticker": canonicalize_any(t),
+                "recovery_state": recov.get("downstream_state"),
+                "missing_ticker_recovery": recov,
+                "not_in_prior_shortlist": True,
+                "eligibility_state": "COVERED",
+            },
+        )
+        row["intraday"] = (intraday_pack.get("by_ticker") or {}).get(t) or {
+            "ticker": t, "intraday_available": False, "intervals": [], "ohlcv": {},
+            "intraday_fetch_state": "UNKNOWN_FAILURE",
+            "error_class": "NOT_IN_FETCH_PACK",
+        }
+        row["intraday_available"] = bool(row["intraday"].get("intraday_available"))
+        row["intraday_fetch_state"] = row["intraday"].get("intraday_fetch_state")
+        row["intraday_cache_status"] = row["intraday"].get("cache_status") or row["intraday"].get("status")
+        row["session_volume"] = (row.get("intraday") or {}).get("session_volume")
+        row["depth"] = (row.get("intraday") or {}).get("depth") or unavailable_book()
+        row["trades"] = (row.get("intraday") or {}).get("trades") or unavailable_tape()
+        row["session_snapshot"] = snapshots.get(t)
+        candidate_metrics.append(row)
+        present.add(t)
+
     # --- files (v0.5 names + backward-compatible aliases) ---
     rows_to_csv(out_root / "universe.csv", universe_rows)
+    rows_to_csv(out_root / "universe_identity.csv", universe_identity or [{"note": "none"}])
+    write_json(out_root / "session_snapshots.json", {"snapshots": snapshots, "count": len(snapshots)})
+    write_json(out_root / "missing_ticker_recovery_log.json", recovery_log)
+    from egxbridge.collect_universe import collection_report_for_db
+    collection_report = collection_report_for_db(db, as_of=as_of)
+    write_json(out_root / "daily_collection_report.json", collection_report)
+    write_json(out_root / "supplemental_market_snapshot.json", collection_report.get("supplemental_market_snapshot") or {"status": "NOT_REQUESTED"})
+    from egxbridge.daily_bars import select_daily_pool, ohlcv_issue
+    write_jsonl(out_root / "daily_rejected_ohlcv.jsonl", [
+        {"ticker": t, "provider": r.get("provider"), "reason": ohlcv_issue(r), "bar": r}
+        for t in tickers
+        for r in (db.fetch_candles(t, "1d", limit=5000) if db is not None else [])
+        if ohlcv_issue(r)
+    ])
+    if db is not None:
+        write_jsonl(out_root / "daily_collection_rejections.jsonl", [
+            r for r in db.fetch_conflicts(limit=-1) if r.get("field") == "daily_ohlcv_validation"
+        ])
+    write_jsonl(out_root / "daily_ohlcv.jsonl", [
+        {"ticker": t, "interval": "1d", "bars": select_daily_pool(
+            db.fetch_candles(t, "1d", limit=5000), as_of=as_of,
+        )[0] if db is not None else []}
+        for t in tickers if (status_by.get(t) or {}).get("security_type") == EQUITY
+    ])
+    ohlcv_1m = []
+    ohlcv_5m = []
+    ohlcv_15m = []
+    for t, rec in (intraday_pack.get("by_ticker") or {}).items():
+        series = rec.get("ohlcv") or {}
+        if series.get("1m"):
+            ohlcv_1m.append({"ticker": t, "security_id": t, "interval": "1m", "bars": series["1m"]})
+        if series.get("5m"):
+            ohlcv_5m.append({"ticker": t, "security_id": t, "interval": "5m", "bars": series["5m"]})
+        if series.get("15m"):
+            ohlcv_15m.append({"ticker": t, "security_id": t, "interval": "15m", "bars": series["15m"]})
+    write_jsonl(out_root / "intraday_1m.jsonl", ohlcv_1m)
+    write_jsonl(out_root / "intraday_5m.jsonl", ohlcv_5m)
+    write_jsonl(out_root / "intraday_15m.jsonl", ohlcv_15m)
     rows_to_csv(out_root / "market_universe.csv", market_universe)
     rows_to_csv(out_root / "universe_failures.csv", unavailable_rows or [{"note": "none"}])
     rows_to_csv(out_root / "data_unavailable.csv", unavailable_rows or [{"note": "none"}])
@@ -601,6 +823,27 @@ def prepare_explorer_handoff(
     rows_to_csv(out_root / "prescreen_rejections.csv", rejection_rows or [{"note": "none"}])
     rows_to_csv(out_root / "intraday_enrichment.csv", intraday_pack.get("rows") or [{"note": "none"}])
     rows_to_csv(out_root / "intraday_failures.csv", intraday_pack.get("failures") or [{"note": "none"}])
+    fetch_rows = []
+    for t, rec in (intraday_pack.get("by_ticker") or {}).items():
+        fetch_rows.append({
+            "ticker": t,
+            "intraday_fetch_state": rec.get("intraday_fetch_state"),
+            "provider_symbol": rec.get("provider_symbol"),
+            "attempt_count": rec.get("attempt_count"),
+            "first_attempt_timestamp": rec.get("first_attempt_timestamp"),
+            "last_attempt_timestamp": rec.get("last_attempt_timestamp"),
+            "error_class": rec.get("error_class"),
+            "error_message_sanitized": rec.get("error_message_sanitized"),
+            "bars_returned_1m": rec.get("bars_returned_1m"),
+            "bars_returned_5m": rec.get("bars_returned_5m"),
+            "bars_returned_15m": rec.get("bars_returned_15m"),
+            "latest_bar_timestamp": rec.get("latest_bar_timestamp"),
+            "cache_status": rec.get("cache_status"),
+            "status": rec.get("status"),
+            "fallback_used": rec.get("fallback_used"),
+            "fallback_source": rec.get("fallback_source"),
+        })
+    rows_to_csv(out_root / "intraday_fetch_diagnostics.csv", fetch_rows or [{"note": "none"}])
 
     cand_flat = [_flatten_candidate(c) for c in candidate_metrics]
     rows_to_csv(out_root / "candidate_metrics.csv", cand_flat or [{"note": "none"}])
@@ -649,6 +892,10 @@ def prepare_explorer_handoff(
         "SCANNER_ELIGIBLE_SYMBOLS": len(uni.get("SCANNER_ELIGIBLE_SYMBOLS") or []),
         "PRESCREEN_SELECTED": len(prescreen_all),
         "INTRADAY_ENRICHED": int(intraday_pack.get("intraday_enriched") or 0),
+        "INTRADAY_OHLCV": int(intraday_pack.get("intraday_ohlcv_count") or 0),
+        "INTRADAY_BASIC": sum(s.get("evidence_kind") in {"BAR", "QUOTE"} and s.get("current_mover_evidence", False) for s in snapshots.values()),
+        "DAILY_SNAPSHOTS": sum(s.get("evidence_kind") == "DAILY_CLOSE" for s in snapshots.values()),
+        "RECOVERED_TICKERS": len(recovered_tickers),
         "HANDOFF_CANDIDATES": len(candidate_metrics),
         "universe_total": uni["UNIVERSE_TOTAL"],
         "mapped_symbols": len(yahoo_mapped_eq),
@@ -674,9 +921,14 @@ def prepare_explorer_handoff(
             "mapped_coverage_pct", "daily_data_coverage_pct", "scanner_eligible_coverage_pct",
             "eligible_coverage_pct", "EXPLORER_COVERAGE", "selection_basis", "selection_bias_risk",
             "market_wide_confidence_allowed",
+            "exploratory_coverage_quality",
+            "whole_egx_claim_allowed",
         )},
+        "intraday_provider_state": (intraday_pack.get("intraday_fetch_diagnostics") or {}).get("provider_state"),
+        "INTRADAY_PROVIDER_STATE": (intraday_pack.get("intraday_fetch_diagnostics") or {}).get("provider_state"),
     }
-    latest_session = max(latest_sessions) if latest_sessions else None
+    latest_session = max((st["latest_session"] for st in status_by.values()
+                          if st.get("security_type") == EQUITY and st.get("latest_session")), default=None)
     from egxbridge.analysis.schedule.identity import make_explorer_run_id
     explorer_run_id = make_explorer_run_id(
         environment=environment, latest_session=latest_session, generated_at=generated_at,
@@ -693,7 +945,8 @@ def prepare_explorer_handoff(
         "sources": uni.get("sources") or [],
     }
     write_json(out_root / "universe_summary.json", universe_summary)
-    write_json(out_root / "universe_coverage.json", counts)
+    write_json(out_root / "universe_coverage.json", {**counts, **universe_coverage})
+    write_json(out_root / "intraday_fetch_diagnostics.json", intraday_pack.get("intraday_fetch_diagnostics") or {})
     write_json(out_root / "prescreen_stage_a.json", {
         "stage": "A",
         "description": "Deterministic broad-universe pre-screen; production rank is candidate_score_calibrated (HEURISTIC_UNCALIBRATED)",
@@ -779,6 +1032,7 @@ def prepare_explorer_handoff(
         "scanner_candidate_count": counts["scanner_candidate_count"],
         "handoff_candidate_count": counts["handoff_candidate_count"],
         "counts": counts,
+        "daily_data_status": list(status_by.values()),
         "coverage": coverage,
         "funnel_coverage": funnel_coverage,
         "funnel_status_counts": funnel_coverage,
@@ -808,7 +1062,7 @@ def prepare_explorer_handoff(
         "market_breadth": market_breadth,
         "market_participation": market_participation(market_breadth),
         "candidate_breadth": candidate_breadth,
-        "intraday_queried_tickers": intraday_pack.get("queried_tickers") or [],
+        "intraday_queried_tickers": list(intraday_pack.get("queried_tickers") or enrich_tickers),
         "lane_tops": lane_leaders,
         "score_kind": SCORE_KIND,
         "scoring_version": SCORING_VERSION,
@@ -818,9 +1072,42 @@ def prepare_explorer_handoff(
         "correlation_calibrated": corr_calibrated,
         "intraday_selection": enrich_sel,
         "orders_generated": False,
+        "universe_coverage": universe_coverage,
+        "universe_identity": universe_identity,
+        "session_snapshots": snapshots,
+        "missing_ticker_recovery_log": recovery_log,
+        "recovered_tickers": recovered_tickers,
+        "alias_corrections": [
+            {"alias_observed": a, "canonical_ticker": canonicalize_any(a)}
+            for names in name_aliases.values() for a in names
+            if canonicalize_any(a) and canonicalize_any(a) != str(a).upper()
+        ],
+        "lookahead_guard_pass": bool(intraday_pack.get("lookahead_guard_pass", True)),
+        "future_timestamp_records_rejected": int(intraday_pack.get("future_timestamp_records_rejected") or 0),
+        "stale_records_rejected": int(intraday_pack.get("stale_records_rejected") or 0),
+        "intraday_fetch_diagnostics": intraday_pack.get("intraday_fetch_diagnostics") or {},
+        "intraday_refreshed_at": intraday_pack.get("fetched_at"),
+        "intraday_fetch_started_at": intraday_pack.get("fetch_started_at"),
+        "daily_collection_report": collection_report,
+        "intraday_fetch_by_ticker": {
+            t: {k: v for k, v in rec.items() if k != "ohlcv"}
+            for t, rec in (intraday_pack.get("by_ticker") or {}).items()
+        },
     }
+    from egxbridge.analysis.schedule.session import session_context as _stamp_session
+    data_stamp = build_data_stamp(
+        packaged_at=utc_now(),
+        session_close_date=latest_session,
+        session_phase=(_stamp_session() or {}).get("session_phase"),
+        explorer_payload=payload,
+        intraday_pack=intraday_pack,
+        package_kind="EXPLORER_HANDOFF",
+    )
+    payload["data_stamp"] = data_stamp
+    write_json(out_root / "intraday_fetch_by_ticker.json", payload["intraday_fetch_by_ticker"])
     write_json(out_root / "explorer_handoff.json", payload)
-    write_text(out_root / "explorer_handoff.md", f"""# EGX Explorer Handoff — {config.horizon}
+    write_package_stamp(out_root, data_stamp)
+    write_text(out_root / "explorer_handoff.md", stamp_markdown(data_stamp) + "\n---\n" + f"""# EGX Explorer Handoff — {config.horizon}
 
 Generated: {payload['generated_at']}
 AI MODE: CHATGPT_HANDOFF
@@ -845,6 +1132,8 @@ The local pre-screen is **not** a recommendation.
 - SCANNER_ELIGIBLE_SYMBOLS: {counts['SCANNER_ELIGIBLE_SYMBOLS']}
 - PRESCREEN_SELECTED: {counts['PRESCREEN_SELECTED']}
 - INTRADAY_ENRICHED: {counts['INTRADAY_ENRICHED']}
+- INTRADAY_OHLCV: {counts.get('INTRADAY_OHLCV')}
+- RECOVERED_TICKERS: {counts.get('RECOVERED_TICKERS')}
 - HANDOFF_CANDIDATES: {counts['HANDOFF_CANDIDATES']}
 - daily_data_coverage_pct: {counts['daily_data_coverage_pct']}
 - scanner_eligible_coverage_pct: {counts['scanner_eligible_coverage_pct']}
@@ -1010,6 +1299,15 @@ See python -m egxbridge.analysis.prepare_schedules for the five independent anal
     man = finalize_manifest(manifest, out_root)
     man.update({
         "explorer_version": EXPLORER_VERSION,
+        "generated_at_cairo": data_stamp.get("packaged_at_cairo"),
+        "source_cutoff_cairo": (data_stamp.get("intraday") or {}).get("last_bar_cairo") or data_stamp.get("packaged_at_cairo"),
+        "source_cutoff_by_provider": {
+            "yahoo": latest_session,
+            "tradingview": (data_stamp.get("intraday") or {}).get("last_bar_cairo"),
+        },
+        "latest_bar_timestamp": (data_stamp.get("intraday") or {}).get("last_bar_utc"),
+        "latest_trade_timestamp": None,
+        "latest_depth_timestamp": None,
         "data_capture_cutoff": generated_at,
         "latest_completed_market_session": latest_session,
         "target_next_working_day_if_known": "UNKNOWN",
@@ -1021,7 +1319,26 @@ See python -m egxbridge.analysis.prepare_schedules for the five independent anal
         "scanner_eligible_symbols": counts["SCANNER_ELIGIBLE_SYMBOLS"],
         "prescreen_selected": counts["PRESCREEN_SELECTED"],
         "intraday_enriched": counts["INTRADAY_ENRICHED"],
+        "intraday_ohlcv_count": counts.get("INTRADAY_OHLCV") or 0,
+        "intraday_basic_count": counts.get("INTRADAY_BASIC") or 0,
+        "daily_snapshot_count": counts.get("DAILY_SNAPSHOTS") or 0,
+        "intraday_deep_enriched_count": counts["INTRADAY_ENRICHED"],
+        "trade_tape_count": 0,
+        "depth_count": 0,
         "handoff_candidates": counts["HANDOFF_CANDIDATES"],
+        "universe_expected": universe_coverage.get("expected_equities"),
+        "universe_eligible": universe_coverage.get("scanner_eligible"),
+        "universe_covered": universe_coverage.get("covered"),
+        "universe_coverage": universe_coverage,
+        "coverage_status": universe_coverage.get("coverage_status"),
+        "run_scope": universe_coverage.get("run_scope"),
+        "missing_tickers": universe_coverage.get("missing_tickers") or [],
+        "recovered_tickers": recovered_tickers,
+        "alias_corrections": payload.get("alias_corrections") or [],
+        "lookahead_guard_pass": bool(intraday_pack.get("lookahead_guard_pass", True)),
+        "future_timestamp_records_rejected": int(intraday_pack.get("future_timestamp_records_rejected") or 0),
+        "stale_records_rejected": int(intraday_pack.get("stale_records_rejected") or 0),
+        "intraday_fetch_diagnostics": payload.get("intraday_fetch_diagnostics") or {},
         "funnel_status_counts": funnel_coverage,
         "research_data_quality_summary": rdq_summary,
         "execution_grade_summary": exec_summary,
@@ -1033,11 +1350,13 @@ See python -m egxbridge.analysis.prepare_schedules for the five independent anal
         "not_a_probability": True,
         "intraday_queried_tickers": enrich_tickers,
         "lane_tops": lane_leaders,
+        "data_stamp": data_stamp,
     })
     write_json(out_root / "manifest.json", man)
 
-    zip_path = HERE / "output" / f"EGX_EXPLORER_HANDOFF_{dated}.zip"
+    zip_path = (output_base if defaulted else out_root.parent) / dated_zip_name("EGX_EXPLORER_HANDOFF", data_stamp)
     zip_directory(out_root, zip_path, arc_root="EGX_EXPLORER_HANDOFF")
+    write_zip_sidecar(zip_path, data_stamp)
 
     run_id = None
     if store:
@@ -1045,30 +1364,14 @@ See python -m egxbridge.analysis.prepare_schedules for the five independent anal
         for c in candidate_metrics:
             store.insert_explorer_candidate(run_id, c["ticker"], c)
 
-    ws = HERE / "workspace" / "explorer"
-    ws.mkdir(parents=True, exist_ok=True)
-    write_json(ws / "last_run.json", {
-        "zip_path": str(zip_path),
-        "package_dir": str(out_root),
-        "run_id": run_id,
-        "explorer_run_id": explorer_run_id,
-        "manifest": man,
-        "counts": counts,
-        "coverage": coverage,
-        "environment": environment,
-    })
-
-    if defaulted:
-        # Convenience copies for the dashboard (dated dir remains canonical).
-        alias_root = HERE / "output" / "explorer_handoff"
-        for name in (
-            "candidate_metrics.csv", "universe.csv", "universe_summary.json",
-            "prescreen_candidates.csv", "prescreen_candidates_calibrated.csv",
-            "legacy_vs_calibrated_ranking.csv", "manifest.json", "market_breadth.json",
-        ):
-            src = out_root / name
-            if src.exists():
-                shutil.copy2(src, alias_root / name)
+    if defaulted and environment == PRODUCTION:
+        ws = HERE / "workspace" / "explorer"
+        write_json(ws / "last_run.json", {
+            "zip_path": str(zip_path), "package_dir": str(out_root),
+            "run_id": run_id, "explorer_run_id": explorer_run_id,
+            "manifest": man, "counts": counts, "coverage": coverage,
+            "environment": environment,
+        })
 
     return {
         "package_dir": str(out_root),

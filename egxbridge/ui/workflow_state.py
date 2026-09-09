@@ -43,21 +43,21 @@ ACTION_LABELS = {
     ACTION_EXPORT_OR_IMPORT: "Send the package to ChatGPT",
     ACTION_IMPORT_CHATGPT: "Import ChatGPT results",
     ACTION_FUNNEL: "Continue company valuation",
-    ACTION_INTRADAY: "Refresh live Intraday evidence",
+    ACTION_INTRADAY: "Refresh today's Intraday",
     ACTION_UPDATE_OUTCOMES: "Update signal outcomes",
     ACTION_WEEKLY: "Prepare the weekly review",
     ACTION_WAIT: "Wait for the next completed session",
 }
 
 ACTION_CTA = {
-    ACTION_REFRESH_MARKET_DATA: "Refresh and scan Explorer",
-    ACTION_RUN_EXPLORER: "Run Broad Explorer",
+    ACTION_REFRESH_MARKET_DATA: "1. Update data and scan",
+    ACTION_RUN_EXPLORER: "1. Scan collected data",
     ACTION_REVIEW_CANDIDATES: "Open candidate list",
-    ACTION_PREPARE_NEXT_SESSION: "Prepare next-session package",
-    ACTION_EXPORT_OR_IMPORT: "Download EGX_CHATGPT_HANDOFF.zip",
+    ACTION_PREPARE_NEXT_SESSION: "2. Prepare ChatGPT ZIP",
+    ACTION_EXPORT_OR_IMPORT: "3. Download ZIP for ChatGPT",
     ACTION_IMPORT_CHATGPT: "Import this ChatGPT file",
     ACTION_FUNNEL: "Prepare Funnel for the named ticker",
-    ACTION_INTRADAY: "Refresh Intraday evidence",
+    ACTION_INTRADAY: "Refresh today's Intraday",
     ACTION_UPDATE_OUTCOMES: "Update signal outcomes",
     ACTION_WEEKLY: "Prepare Weekly X-Ray",
     ACTION_WAIT: None,
@@ -246,6 +246,8 @@ def next_recommended_action(snapshot: dict[str, Any]) -> dict[str, str]:
     """Derive the single next operator action from actual state."""
     intra = snapshot.get("intraday") or {}
     if not snapshot.get("data_usable"):
+        code = ACTION_WAIT if snapshot.get("daily_refresh_checked") else ACTION_REFRESH_MARKET_DATA
+    elif snapshot.get("daily_bars_lagging") and not snapshot.get("daily_refresh_checked"):
         code = ACTION_REFRESH_MARKET_DATA
     elif snapshot.get("explorer_status") in {None, "NOT_RUN", "FAILED"}:
         code = ACTION_RUN_EXPLORER
@@ -271,6 +273,8 @@ def next_recommended_action(snapshot: dict[str, Any]) -> dict[str, str]:
         code = ACTION_WAIT
     elif snapshot.get("candidate_count"):
         code = ACTION_REVIEW_CANDIDATES
+    elif snapshot.get("daily_refresh_checked"):
+        code = ACTION_WAIT
     else:
         code = ACTION_REFRESH_MARKET_DATA
     return {
@@ -320,9 +324,22 @@ def daily_bars_already_usable(snapshot: dict[str, Any], *, min_eligible: int = 3
 
 
 def should_skip_market_refresh(snapshot: dict[str, Any]) -> bool:
-    """Closed/weekend: latest completed session bars remain valid. Do not refetch Yahoo."""
+    """Skip daily refetch when usable bars already cover the expected completed session.
+
+    Continuous trading still skips daily Yahoo when closes are current — live confirmation
+    is handled by the separate Intraday refresh, not by re-collecting the equity universe.
+    """
     if not daily_bars_already_usable(snapshot):
         return False
+    if snapshot.get("daily_bars_lagging"):
+        return False
+    stored = snapshot.get("price_session") or snapshot.get("latest_completed_market_session")
+    expected = snapshot.get("expected_session")
+    if expected and (not stored or str(stored)[:10] < str(expected)[:10]):
+        return False
+    # Usable + not lagging: skip regardless of session phase.
+    if expected and stored and str(stored)[:10] >= str(expected)[:10]:
+        return True
     return snapshot.get("freshness") == "STALE_EXPECTED" or snapshot.get("session_phase") in STALE_EXPECTED_PHASES
 
 
@@ -354,9 +371,14 @@ def focus_steps(action_code: str | None) -> set[int]:
 
 def action_hint(code: str | None, snapshot: dict[str, Any] | None = None) -> str:
     snap = snapshot or {}
+    if code == ACTION_REFRESH_MARKET_DATA and snap.get("daily_bars_lagging"):
+        return (
+            snap.get("daily_session_note")
+            or "Stored daily closes lag the last completed EGX session — refresh to pull Yahoo, then TradingView if needed."
+        )
     if code == ACTION_REFRESH_MARKET_DATA and should_skip_market_refresh(snap):
         return (
-            "Market is closed. Cached daily bars stay valid — scan Explorer without refetching Yahoo."
+            "Daily closes are already current — Scan market will run Explorer only (no Yahoo wait)."
         )
     if code == ACTION_RUN_EXPLORER and snap.get("freshness") == "STALE_EXPECTED":
         return snap.get("freshness_note") or (
@@ -370,7 +392,7 @@ def action_hint(code: str | None, snapshot: dict[str, Any] | None = None) -> str
         ACTION_EXPORT_OR_IMPORT: "Download one ZIP. Upload that file in ChatGPT. Do not import yet.",
         ACTION_IMPORT_CHATGPT: "Upload each saved ChatGPT reply. The ZIP you downloaded is not a result.",
         ACTION_FUNNEL: "Value & Quality asked for a company valuation. Fair Value is never calculated here.",
-        ACTION_INTRADAY: "Continuous trading is open. Refresh evidence before confirmation analysis.",
+        ACTION_INTRADAY: "Continuous trading is open. Refresh today's TradingView bars before confirmation analysis.",
         ACTION_UPDATE_OUTCOMES: "Calculate returns after 1, 2, 5, 10 and 20 trading sessions, plus the best and worst price moves.",
         ACTION_WEEKLY: "Historical review only. Scoring stays frozen at 0.5.1 / HEURISTIC_UNCALIBRATED.",
         ACTION_WAIT: "Wait for a completed session before updating outcomes.",
@@ -380,6 +402,9 @@ def action_hint(code: str | None, snapshot: dict[str, Any] | None = None) -> str
 
 def action_steps(code: str | None, snapshot: dict[str, Any] | None = None) -> list[str]:
     snap = snapshot or {}
+    if code == ACTION_WAIT and snap.get("daily_refresh_checked") and not snap.get("data_usable"):
+        return ["The last collection finished without usable daily prices. Check Data details for the provider errors.",
+                "Retry there when a source recovers; the app will not repeat the collection automatically."]
     jobs = snap.get("schedule", {}).get("included_jobs") if isinstance(snap.get("schedule"), dict) else None
     jobs = jobs or list(NEXT_SESSION_JOBS)
     job_txt = ", ".join(JOB_LABELS.get(j, j) for j in jobs)

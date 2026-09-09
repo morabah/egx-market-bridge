@@ -46,6 +46,7 @@ class Settings:
         "tradingview": True,
         "borsa": False,
         "investor_egx": True,
+        "egxpilot": True,
     })
     provider_priority: dict[str, list[str]] = field(default_factory=lambda: {
         "intraday_ohlcv": ["egid", "tradingview", "borsa", "yahoo"],
@@ -93,7 +94,7 @@ class Settings:
 
         # Merge enabled_providers defaults
         defaults_ep = {
-            "egid": True, "yahoo": True, "tradingview": True, "borsa": False, "investor_egx": True,
+            "egid": True, "yahoo": True, "tradingview": True, "borsa": False, "investor_egx": True, "egxpilot": True,
         }
         defaults_ep.update(obj.enabled_providers or {})
         obj.enabled_providers = defaults_ep

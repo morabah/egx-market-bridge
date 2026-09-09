@@ -182,9 +182,9 @@ class Database:
             """INSERT INTO symbols(canonical, name, aliases_json, sector, active, updated_at)
                VALUES(?,?,?,?,1,?)
                ON CONFLICT(canonical) DO UPDATE SET
-                 name=excluded.name,
+                 name=COALESCE(NULLIF(excluded.name, ''), symbols.name),
                  aliases_json=excluded.aliases_json,
-                 sector=excluded.sector,
+                 sector=COALESCE(NULLIF(excluded.sector, ''), symbols.sector),
                  updated_at=excluded.updated_at
             """,
             (canonical.upper(), name, json.dumps(aliases or {}), sector, _now()),
@@ -206,7 +206,7 @@ class Database:
         )
         self._conn.commit()
 
-    def upsert_candle(self, c: dict[str, Any]):
+    def upsert_candle(self, c: dict[str, Any], *, commit: bool = True):
         # Canonical storage key: prefer normalized UTC when present (never ambiguous legacy labels).
         ts = c.get("normalized_utc_timestamp") or c.get("timestamp")
         semantic_keys = (
@@ -214,7 +214,7 @@ class Database:
             "normalized_utc_timestamp", "normalized_cairo_timestamp",
             "timestamp_semantics", "session_date", "effective_session_date",
             "volume_semantics", "volume_interval", "price_observation_type",
-            "latest_completed_session", "freshness_class",
+            "latest_completed_session", "freshness_class", "daily_session_complete",
             "timestamp_normalization_status",
         )
         semantics = {k: c.get(k) for k in semantic_keys if c.get(k) is not None}
@@ -239,9 +239,10 @@ class Database:
                 json.dumps(semantics) if semantics else None,
             ),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
-    def insert_conflict(self, c: dict[str, Any]):
+    def insert_conflict(self, c: dict[str, Any], *, commit: bool = True):
         self._conn.execute(
             """INSERT INTO data_conflicts(
                 symbol, field, provider_a, value_a, timestamp_a, provider_b, value_b, timestamp_b,
@@ -253,7 +254,8 @@ class Database:
                 c.get("selected_provider"), c.get("reason"), c.get("created_at"),
             ),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def upsert_provider_status(self, st: dict[str, Any]):
         self._conn.execute(

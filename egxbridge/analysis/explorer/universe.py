@@ -11,11 +11,12 @@ def build_explorer_universe(
     *,
     explicit: list[str] | None = None,
     min_scanner_bars: int = 20,
+    as_of=None,
 ) -> dict[str, Any]:
     """Assemble whole-EGX discovery universe. Never silently drop unavailable symbols."""
     built = build_canonical_universe(db=db, explicit=explicit)
     assessed = assess_universe_coverage(
-        built, db=db, min_scanner_bars=min_scanner_bars, stock_explorer_only=True,
+        built, db=db, min_scanner_bars=min_scanner_bars, stock_explorer_only=True, as_of=as_of,
     )
     # Old Explorer tests iterate MAPPED_SYMBOLS as the discovery list (do not drop).
     discovery = list(assessed.get("all_symbols") or [])

@@ -79,7 +79,7 @@ def operator_hero(*, title: str, session: str | None, phase: str | None, cairo: 
 <div class="op-hero">
   <h1 class="op-hero-title">{_esc(title)}</h1>
   {extra}
-  <p class="op-meta">Latest data: {_esc(session or "not collected yet")} · {_esc(display_label(phase))} · Cairo {_esc(cairo_short)}</p>
+  <p class="op-meta">Session closes through {_esc(session or "not collected yet")} · {_esc(display_label(phase))} · Cairo {_esc(cairo_short)}</p>
 </div>
         """.strip(),
         unsafe_allow_html=True,
@@ -123,7 +123,7 @@ def source_caption(source: str):
     st.caption(f"Source: {source}")
 
 
-def download_zip(path: str | Path | None, *, label: str, key: str, primary: bool = False, download_name: str | None = None):
+def download_zip(path: str | Path | None, *, label: str, key: str, primary: bool = False, download_name: str | None = None, stamp: dict[str, Any] | None = None):
     if not path:
         st.caption(f"{label}: not prepared yet.")
         return False
@@ -131,15 +131,53 @@ def download_zip(path: str | Path | None, *, label: str, key: str, primary: bool
     if not p.exists():
         st.caption(f"{label}: file is no longer on disk.")
         return False
+    from egxbridge.analysis.common.data_stamp import dated_zip_name, load_zip_stamp, stamp_caption
+    stamp = stamp or load_zip_stamp(p)
+    if stamp:
+        stem = Path(download_name).stem if download_name else p.stem.split("_session-")[0]
+        name = dated_zip_name(stem, stamp)
+    else:
+        name = download_name or p.name
     data = p.read_bytes()
     st.download_button(
         label,
         data=data,
-        file_name=download_name or p.name,
+        file_name=name or p.name,
         mime="application/zip",
         key=key,
         type="primary" if primary else "secondary",
     )
+    import io
+    import zipfile
+    from egxbridge.analysis.common.data_stamp import delay_seconds
+    from egxbridge.semantics import previous_egx_session_date
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if stamp:
+        daily = stamp.get("daily_coverage") or {}
+        session = stamp.get("session_close_date")
+        if daily.get("state") in {"PARTIAL", "UNKNOWN"} or not session or session < previous_egx_session_date(now):
+            st.warning("This package has stale, missing, or unverified daily evidence. Check the per-company data report before using it.")
+        age = delay_seconds(now, (stamp.get("intraday") or {}).get("last_bar_utc"))
+        if age is not None:
+            st.caption(f"Newest intraday bar is {int(age // 60)} minutes old now. Downloading keeps the original data and timestamps.")
+    with st.popover("Download contents and data status"):
+        st.caption(f"File: {name} · Size: {len(data) / 1024:.1f} KB")
+        if stamp:
+            st.write(stamp.get("daily_coverage") or {})
+            daily_rows = stamp.get("daily_tickers") or []
+            if daily_rows:
+                st.dataframe(pd.DataFrame(daily_rows), hide_index=True, use_container_width=True)
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                st.write(archive.namelist())
+        except zipfile.BadZipFile:
+            st.warning("This file is not a readable ZIP. Prepare the package again.")
+    cap = stamp_caption(stamp)
+    if cap:
+        st.caption(cap)
+    else:
+        st.caption(f"Downloads as `{name or p.name}`. Prepare again if you need a newer capture time.")
     return True
 
 
@@ -156,14 +194,29 @@ def candidate_table(rows: list[dict[str, Any]], *, key: str, help_text: str | No
         return
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True, key=key, column_config={
-        "Close": st.column_config.NumberColumn("Close (EGP)", format="%.2f"),
+        "Session close": st.column_config.NumberColumn(
+            "Session close (EGP)",
+            format="%.2f",
+            help="Last completed EGX daily close — not today's live price.",
+        ),
+        "Close": st.column_config.NumberColumn("Session close (EGP)", format="%.2f"),
+        "Today": st.column_config.NumberColumn(
+            "Today (EGP)",
+            format="%.2f",
+            help="Latest TradingView intraday price for the current session. Refresh Today's Intraday to fill this.",
+        ),
+        "Session": st.column_config.TextColumn("Session date", help="EGX cash-session date for the completed close."),
+        "Price source": st.column_config.TextColumn("Price source", help="Provider series used for the session close."),
         "RVOL20": st.column_config.NumberColumn("Relative volume", format="%.2fx", help="Volume divided by its 20-session average. 1× means average volume."),
         "Candidate Score": st.column_config.NumberColumn("Scanner score", format="%.1f", help="Heuristic screening score. This is not a probability or investment decision."),
         "Distance 20D High": st.column_config.NumberColumn("From 20-session high (%)", format="%.2f"),
         "Move Already Realized": st.column_config.TextColumn("Move already made", help="How much of the setup's price move may already have occurred."),
         "Forward Setup": st.column_config.TextColumn("Setup quality", help="Local heuristic based on market evidence; not a ChatGPT conclusion."),
     })
-    st.caption("Local scanner evidence · Rank is a review priority. Scores are heuristic, not a probability of profit.")
+    st.caption(
+        "Session close = last completed EGX day · Today = live/intraday after Refresh Today's Intraday · "
+        "Rank is a review priority, not a probability of profit."
+    )
 
 
 def job_status_label(job: str, imports: dict[str, Any], prepared: bool) -> str:

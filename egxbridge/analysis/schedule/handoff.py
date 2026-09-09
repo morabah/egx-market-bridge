@@ -9,8 +9,15 @@ import hashlib
 from egxbridge import __version__ as BRIDGE_VERSION
 from egxbridge.analysis import WORKFLOW_VERSION
 from egxbridge.analysis.common.ai_mode import AI_CHATGPT_HANDOFF, assert_handoff_only
-from egxbridge.analysis.common.environment import PRODUCTION, normalize_environment
+from egxbridge.analysis.common.environment import PRODUCTION, UNIT_TEST, normalize_environment
 from egxbridge.analysis.common.models import utc_now
+from egxbridge.analysis.common.data_stamp import (
+    build_data_stamp,
+    dated_zip_name,
+    job_stamp_preamble,
+    write_package_stamp,
+    write_zip_sidecar,
+)
 from egxbridge.analysis.common.packaging import write_json, write_text, zip_directory, list_files_relative
 from egxbridge.analysis.explorer.calibration import SCORING_VERSION, SCORE_KIND
 from egxbridge.analysis.schedule.types import (
@@ -20,7 +27,7 @@ from egxbridge.analysis.schedule.types import (
     RESULT_SCHEMA_FILES, ANALYSIS_OBSERVATIONS_N_SEMANTICS, DEPRECATED_FIELDS,
     STALE_EVIDENCE_PHASES, NOT_LIVE_CONFIRMATION_TEXT,
 )
-from egxbridge.analysis.schedule.session import session_context
+from egxbridge.analysis.schedule.session import session_context, parse_dt
 from egxbridge.analysis.schedule.result_schemas import (
     build_all_job_schemas, result_schema_index,
 )
@@ -49,12 +56,16 @@ COMPACT_FIELDS = (
     "intraday_selection_rank_within_lane", "calibrated_rank", "legacy_rank",
     "daily_return", "return_1w", "return_1m", "return_3m", "return_6m",
     "recommended_deep_analysis",
+    "session_date", "latest_session", "expected_session", "daily_bars_lagging", "daily_provider",
 )
 
 
 def _compact(c: dict[str, Any]) -> dict[str, Any]:
     row = {k: c.get(k) for k in COMPACT_FIELDS if c.get(k) is not None}
     m = c.get("metrics") or {}
+    for key in ("latest_session", "expected_session", "daily_bars_lagging", "daily_provider"):
+        row[key] = c.get(key) if c.get(key) is not None else m.get(key)
+    row["session_date"] = c.get("session_date") or row.get("latest_session")
     row.setdefault("RVOL20", c.get("RVOL20") or m.get("rvol_20"))
     row.setdefault("distance_20d_high", c.get("distance_20d_high") or m.get("dist_from_20d_high_pct"))
     row.setdefault("funnel_status", c.get("funnel_status"))
@@ -62,6 +73,29 @@ def _compact(c: dict[str, Any]) -> dict[str, Any]:
     row["score_kind"] = SCORE_KIND
     row["scoring_version"] = SCORING_VERSION
     row["not_a_probability"] = True
+    row["canonical_ticker"] = c.get("canonical_ticker") or c.get("ticker")
+    row["eligibility_state"] = c.get("eligibility_state")
+    row["recovery_state"] = c.get("recovery_state")
+    intra = c.get("intraday") or {}
+    ohlcv = intra.get("ohlcv") if isinstance(intra, dict) else None
+    if ohlcv:
+        row["intraday_ohlcv"] = {
+            k: v for k, v in ohlcv.items() if v
+        }
+    vol = c.get("session_volume") or (intra.get("session_volume") if isinstance(intra, dict) else None)
+    if vol:
+        row["session_volume"] = vol
+    row["depth"] = c.get("depth") or (intra.get("depth") if isinstance(intra, dict) else None)
+    row["trades"] = c.get("trades") or (intra.get("trades") if isinstance(intra, dict) else None)
+    if isinstance(intra, dict):
+        for k in (
+            "intraday_fetch_state", "provider_symbol", "attempt_count",
+            "error_class", "error_message_sanitized", "bars_returned_1m",
+            "bars_returned_5m", "bars_returned_15m", "latest_bar_timestamp",
+            "cache_status", "status", "age_seconds", "fallback_used", "fallback_source",
+        ):
+            if intra.get(k) is not None:
+                row[k] = intra.get(k)
     fctx = c.get("funnel_context") or c.get("funnel_ctx") or {}
     row["imported_funnel_v28"] = {"fields": fctx.get("structured_fields") or {},
         "provenance": fctx.get("structured_provenance") or {}, "funnel_version": fctx.get("funnel_version"),
@@ -158,11 +192,32 @@ def _overlay_identity(
     return row
 
 
-def live_session_evidence_available(candidates: list[dict[str, Any]], session_meta: dict[str, Any] | None) -> bool:
+def _is_live_intraday_row(candidate: dict[str, Any]) -> bool:
+    intra = candidate.get("intraday") or {}
+    fetch_state = None
+    status = None
+    if isinstance(intra, dict):
+        fetch_state = intra.get("intraday_fetch_state") or candidate.get("intraday_fetch_state")
+        status = intra.get("status") or intra.get("cache_status") or candidate.get("intraday_cache_status")
+    if fetch_state in {"STALE_ONLY", "STALE_CACHE"} or status == "STALE_CACHE":
+        return False
+    if fetch_state and fetch_state != "SUCCESS":
+        return False
+    return has_current_session_evidence(candidate)
+
+
+def live_session_evidence_available(
+    candidates: list[dict[str, Any]],
+    session_meta: dict[str, Any] | None,
+    diagnostics: dict[str, Any] | None = None,
+) -> bool:
     phase = (session_meta or {}).get("session_phase")
     if phase in STALE_EVIDENCE_PHASES or phase not in LIVE_PHASES:
         return False
-    return any(has_current_session_evidence(c) for c in candidates)
+    state = (diagnostics or {}).get("provider_state") or (diagnostics or {}).get("INTRADAY_PROVIDER_STATE")
+    if state == "FAILED":
+        return False
+    return any(_is_live_intraday_row(c) for c in candidates)
 
 
 def _deprecated_count_fields(generated_n: Any) -> dict[str, Any]:
@@ -173,14 +228,133 @@ def _deprecated_count_fields(generated_n: Any) -> dict[str, Any]:
     }
 
 
+def _rebuild_universe_identity(payload: dict[str, Any], *, environment: str | None = None) -> list[dict[str, Any]]:
+    from egxbridge.analysis.explorer.universe_state import (
+        identity_row, ensure_canonical_identities, eligibility_state,
+    )
+    from egxbridge.symbols import load_name_aliases, canonicalize_any
+    from egxbridge.universe import EQUITY, build_canonical_universe, assess_universe_coverage
+
+    rows = list(payload.get("universe_identity") or [])
+    aliases = load_name_aliases()
+    expected = None
+    if not rows:
+        if environment == UNIT_TEST:
+            tickers = []
+            for c in payload.get("candidates") or []:
+                if c.get("ticker"):
+                    tickers.append(str(c["ticker"]).upper())
+            for t in payload.get("counts", {}).get("SCANNER_ELIGIBLE_SYMBOLS_LIST") or []:
+                tickers.append(str(t).upper())
+            expected = list(dict.fromkeys(tickers))
+            rows = [
+                identity_row(canonical_ticker=t, instrument_type="EQUITY", data_status="SCANNER_ELIGIBLE")
+                for t in expected
+            ]
+        else:
+            built = build_canonical_universe()
+            assessed = assess_universe_coverage(built, db=None)
+            expected = list((assessed.get("status_by_symbol") or {}).keys())
+            for t, st in (assessed.get("status_by_symbol") or {}).items():
+                rows.append(identity_row(
+                    canonical_ticker=t,
+                    current_name=st.get("current_name") or "",
+                    aliases=st.get("aliases") or [t],
+                    instrument_type=st.get("instrument_type") or st.get("security_type") or EQUITY,
+                    data_status=st.get("data_status"),
+                    eligibility_reason=st.get("exclusion_reason"),
+                ))
+                rows[-1]["eligibility_state"] = eligibility_state(
+                    st.get("data_status"), security_type=st.get("security_type"),
+                )
+                rows[-1]["universe_state"] = rows[-1]["eligibility_state"]
+    else:
+        expected = [str(r.get("canonical_ticker") or "").upper() for r in rows if r.get("canonical_ticker")]
+        if len(expected) >= 50:
+            for canon in aliases:
+                c = canonicalize_any(canon)
+                if c and c not in expected:
+                    expected.append(c)
+    return ensure_canonical_identities(rows, name_aliases=aliases, expected_tickers=expected)
+
+
+def _recover_from_explorer_payload(payload: dict[str, Any], candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from egxbridge.analysis.explorer.session_screen import recover_missing_tickers
+
+    existing_log = list(payload.get("missing_ticker_recovery_log") or [])
+    if existing_log:
+        return candidates, existing_log
+    metrics = payload.get("scanner_eligible_metrics") or []
+    snaps = payload.get("session_snapshots") or {}
+    if isinstance(snaps, dict) and "snapshots" in snaps:
+        snaps = snaps.get("snapshots") or {}
+    shortlist = {str(c.get("ticker") or "").upper() for c in candidates if c.get("ticker")}
+    scored = [{"ticker": r.get("ticker"), "metrics": r} for r in metrics if r.get("ticker")]
+    log = recover_missing_tickers(scored, shortlist_tickers=shortlist, snapshots=snaps)
+    present = {str(c.get("ticker") or "").upper() for c in candidates}
+    for rec in log:
+        t = rec.get("ticker")
+        if not t or t in present:
+            continue
+        src = next((r for r in scored if str(r.get("ticker") or "").upper() == t), {"ticker": t, "metrics": {}})
+        candidates.append({
+            "ticker": t,
+            "canonical_ticker": rec.get("canonical_ticker") or t,
+            "metrics": src.get("metrics") or {},
+            "recovery_state": rec.get("downstream_state"),
+            "missing_ticker_recovery": rec,
+            "intraday_selection_reason": "RECOVERED_CURRENT_MOVER",
+            "intraday_selection_lane": "RECOVERY",
+            "eligibility_state": "COVERED",
+            "not_in_prior_shortlist": True,
+            "intraday": {"ticker": t, "intraday_available": False, "intervals": [], "ohlcv": {},
+                         "intraday_fetch_state": "UNKNOWN_FAILURE"},
+        })
+        present.add(t)
+    return candidates, log
+
+
 def _run_id(generated_at: str) -> str:
     tag = generated_at.replace(":", "").replace("-", "")[:15]
     h = hashlib.sha256(generated_at.encode()).hexdigest()[:8]
     return f"{tag}_{h}"
 
 
-def load_explorer_package(package_dir: Path) -> dict[str, Any]:
+def load_explorer_package(package_dir: Path, *, db=None, store=None, require_current: bool = False) -> dict[str, Any]:
     payload = json.loads((package_dir / "explorer_handoff.json").read_text(encoding="utf-8"))
+    if require_current:
+        from egxbridge.semantics import previous_egx_session_date
+        expected = previous_egx_session_date()
+        required = ("daily_ohlcv.jsonl", "daily_collection_report.json", "daily_rejected_ohlcv.jsonl", "daily_collection_rejections.jsonl")
+        identities = payload.get("universe_identity") or []
+        equities = sum(r.get("instrument_type") == "EQUITY" for r in identities)
+        daily = (payload.get("data_stamp") or {}).get("daily_coverage") or {}
+        source_coverage = payload.get("universe_coverage") or {}
+        from egxbridge.collect_universe import collection_report_for_db
+        report = collection_report_for_db(db, as_of=parse_dt(utc_now()))
+        collected = parse_dt(report.get("finished_at"))
+        created = parse_dt(payload.get("generated_at"))
+        needs_rebuild = (
+            payload.get("environment") != PRODUCTION
+            or not all((package_dir / name).is_file() for name in required)
+            or not payload.get("daily_data_status")
+            or daily.get("expected_session") != expected
+            or (payload.get("counts") or {}).get("EQUITY_UNIVERSE_TOTAL") != equities
+            or not source_coverage.get("reconcile_ok")
+            or (payload.get("counts") or {}).get("SCANNER_ELIGIBLE_SYMBOLS") != source_coverage.get("scanner_eligible")
+            or bool(collected and (not created or collected > created))
+            or any(c.get("data_status") == "SCANNER_ELIGIBLE" and (
+                c.get("latest_session") != expected or c.get("daily_bars_lagging") is not False
+            ) for c in payload.get("candidates") or [])
+        )
+        if needs_rebuild:
+            if db is None:
+                raise ValueError("Daily evidence is missing or outdated. Run Broad Explorer from the market database before exporting.")
+            from egxbridge.analysis.explorer.handoff import prepare_explorer_handoff
+            from egxbridge.analysis.explorer.models import ExplorerRunConfig
+            result = prepare_explorer_handoff(ExplorerRunConfig(environment=PRODUCTION), db=db, store=store)
+            package_dir = Path(result["package_dir"])
+            payload = json.loads((package_dir / "explorer_handoff.json").read_text(encoding="utf-8"))
     payload["_package_dir"] = str(package_dir)
     from egxbridge.analysis.schedule.market_summary import load_scanner_eligible_metrics, compute_breadth, MARKET_BREADTH_SCOPE, SHORTLIST_BREADTH_LABEL
     if not payload.get("scanner_eligible_metrics"):
@@ -293,13 +467,19 @@ def prepare_schedule_handoffs(
     env = normalize_environment(environment or getattr(store, "environment", None) or PRODUCTION)
     if explorer_payload is None:
         if explorer_package_dir is None:
-            last = HERE / "workspace" / "explorer" / "last_run.json"
-            if last.exists():
-                meta = json.loads(last.read_text(encoding="utf-8"))
-                explorer_package_dir = Path(meta.get("package_dir") or "")
+            from egxbridge.ui.snapshot import resolve_explorer_package
+            resolved = resolve_explorer_package(HERE)
+            if resolved.get("package_dir"):
+                explorer_package_dir = Path(resolved["package_dir"])
         if not explorer_package_dir or not Path(explorer_package_dir).exists():
             raise FileNotFoundError("No Explorer package found. Run Explorer first.")
-        explorer_payload = load_explorer_package(Path(explorer_package_dir))
+        explorer_payload = load_explorer_package(Path(explorer_package_dir), db=db, store=store, require_current=env == PRODUCTION)
+        explorer_package_dir = Path(explorer_payload["_package_dir"])
+    elif env == PRODUCTION:
+        if explorer_package_dir is None:
+            raise ValueError("A production handoff requires the Explorer package and its daily source files.")
+        explorer_payload = load_explorer_package(Path(explorer_package_dir), db=db, store=store, require_current=True)
+        explorer_package_dir = Path(explorer_payload["_package_dir"])
     jobs = list(jobs or ANALYSIS_TYPES)
     for j in jobs:
         if j not in ANALYSIS_TYPES:
@@ -312,7 +492,45 @@ def prepare_schedule_handoffs(
         sess = {**session_context(), **sess}
     counts = explorer_payload.get("counts") or {}
     coverage = explorer_payload.get("coverage") or {}
+    identity_rows = _rebuild_universe_identity(explorer_payload, environment=env)
+    explorer_payload["universe_identity"] = identity_rows
+    from egxbridge.analysis.explorer.universe_state import build_universe_coverage
+    from egxbridge.analysis.explorer.intraday_fetch import apply_provider_state_to_coverage
+    uni_cov = build_universe_coverage(identity_rows)
+    fetch_diag = explorer_payload.get("intraday_fetch_diagnostics") or {}
+    uni_cov = apply_provider_state_to_coverage(uni_cov, fetch_diag)
+    explorer_payload["universe_coverage"] = uni_cov
+    from egxbridge.analysis.explorer.coverage import classify_explorer_coverage
+    equity_count = sum(r.get("instrument_type") == "EQUITY" for r in identity_rows)
+    counts = {**counts, "UNIVERSE_TOTAL": len(identity_rows), "universe_total": len(identity_rows),
+              "EQUITY_UNIVERSE_TOTAL": equity_count, "SCANNER_ELIGIBLE_SYMBOLS": uni_cov["scanner_eligible"],
+              "scanner_candidate_count": uni_cov["scanner_eligible"]}
+    coverage = {
+        **classify_explorer_coverage(
+            equity_universe_total=equity_count,
+            mapped_symbols=sum(r.get("instrument_type") == "EQUITY" and r.get("eligibility_state") != "SOURCE_MISSING" for r in identity_rows),
+            daily_data_available=min(int(counts.get("DAILY_DATA_AVAILABLE") or 0), equity_count),
+            scanner_eligible=uni_cov["scanner_eligible"],
+            thresholds=coverage.get("coverage_thresholds"),
+        ),
+        "whole_egx_claim_allowed": bool(uni_cov.get("whole_egx_claim_allowed")),
+        "market_wide_confidence_allowed": bool(uni_cov.get("whole_egx_claim_allowed")),
+        "run_scope": uni_cov.get("run_scope") or coverage.get("selection_basis"),
+    }
+    counts.update({key: coverage[key] for key in (
+        "mapped_coverage_pct", "daily_data_coverage_pct", "scanner_eligible_coverage_pct",
+        "eligible_coverage_pct", "EXPLORER_COVERAGE", "exploratory_coverage_quality",
+        "selection_basis", "selection_bias_risk", "market_wide_confidence_allowed", "whole_egx_claim_allowed",
+    )})
+    explorer_payload["coverage"] = coverage
+    explorer_payload["counts"] = counts
+    explorer_payload["selection_basis"] = coverage["selection_basis"]
+    explorer_payload["selection_bias_risk"] = coverage["selection_bias_risk"]
     candidates = list(explorer_payload.get("candidates") or [])
+    candidates, recovery_log = _recover_from_explorer_payload(explorer_payload, candidates)
+    explorer_payload["candidates"] = candidates
+    explorer_payload["missing_ticker_recovery_log"] = recovery_log
+    explorer_payload["recovered_tickers"] = [r["ticker"] for r in recovery_log if r.get("recovered")]
     latest_session = explorer_payload.get("latest_completed_market_session")
     explorer_run_id = explorer_payload.get("explorer_run_id") or make_explorer_run_id(
         environment=env,
@@ -333,10 +551,20 @@ def prepare_schedule_handoffs(
         "No paid LLM API; ChatGPT handoff only",
         "Do not infer market regime from candidate shortlist breadth",
     ]
-    live_available = live_session_evidence_available(candidates, sess)
+    live_available = live_session_evidence_available(candidates, sess, fetch_diag)
+    if fetch_diag.get("provider_state") == "FAILED":
+        limitations.append(
+            f"INTRADAY_PROVIDER_STATE=FAILED: {fetch_diag.get('success') or 0}/"
+            f"{fetch_diag.get('selected') or 0} selected tickers returned live bars. "
+            "This is not ordinary missing data."
+        )
+        live_available = False
+    elif fetch_diag.get("provider_state") == "NOT_REQUESTED":
+        limitations.append("Intraday live collection was not requested. Cached bars retain their original timestamps and cache status.")
+        live_available = False
     if (sess.get("session_phase") in STALE_EVIDENCE_PHASES) or not live_available:
         limitations.append(NOT_LIVE_CONFIRMATION_TEXT)
-        limitations.append("Intraday bars in this package are from the latest completed session only")
+        limitations.append("Check each intraday bar's session, timestamp and cache status; cached observations may be older or from an incomplete session.")
     market = build_market_summary(
         coverage=coverage,
         counts=counts,
@@ -353,7 +581,7 @@ def prepare_schedule_handoffs(
     intra_tickers = {r.get("ticker") for r in intra_sel} or set(explorer_payload.get("intraday_queried_tickers") or [])
     intra_cands = []
     for c in candidates:
-        if c.get("ticker") in intra_tickers or c.get("intraday_available"):
+        if c.get("ticker") in intra_tickers or c.get("intraday_available") or c.get("recovery_state"):
             row = _compact(c)
             row["intraday"] = c.get("intraday")
             row["session_phase"] = sess.get("session_phase")
@@ -369,6 +597,13 @@ def prepare_schedule_handoffs(
         row["bridge_suggested_funnel_action"] = suggested_funnel_action(c.get("funnel_status"))
         value_cands.append(row)
 
+    data_stamp = build_data_stamp(
+        packaged_at=generated_at,
+        session_close_date=latest_session,
+        session_phase=sess.get("session_phase"),
+        explorer_payload=explorer_payload,
+        package_kind="CHATGPT_HANDOFF",
+    )
     date_tag = generated_at[:10]
     out_root = Path(output_root) if output_root else HERE / "output" / "schedule_handoff" / run_id
     if out_root.exists():
@@ -455,6 +690,7 @@ def prepare_schedule_handoffs(
     )
 
     weekly = _weekly_history(store, explorer_payload)
+    uni_cov = explorer_payload.get("universe_coverage") or {}
 
     explorer_snapshot = {
         "run_id": run_id,
@@ -465,6 +701,7 @@ def prepare_schedule_handoffs(
         "bridge_version": BRIDGE_VERSION,
         "explorer_version": EXPLORER_PACKAGE_VERSION,
         "generated_at": generated_at,
+        "data_stamp": data_stamp,
         "latest_completed_market_session": latest_session,
         "coverage": coverage,
         "counts": {
@@ -484,13 +721,31 @@ def prepare_schedule_handoffs(
         "result_envelope_version": RESULT_ENVELOPE_VERSION,
         "handoff_schema_version": HANDOFF_SCHEMA_VERSION,
         "no_lookahead": True,
+        "universe_coverage": uni_cov,
+        "recovered_tickers": list(explorer_payload.get("recovered_tickers") or []),
+        "intraday_fetch_diagnostics": fetch_diag,
+        "intraday_fetch_by_ticker": explorer_payload.get("intraday_fetch_by_ticker") or {},
+        "whole_egx_claim_allowed": bool(uni_cov.get("whole_egx_claim_allowed")),
+        "exploratory_coverage_quality": coverage.get("exploratory_coverage_quality") or coverage.get("EXPLORER_COVERAGE"),
     }
     generated_n = explorer_snapshot["analysis_observations_generated_n"]
     explorer_snapshot.update(_deprecated_count_fields(generated_n))
     write_json(common / "explorer_snapshot.json", explorer_snapshot)
     write_json(common / "market_summary.json", market)
     rows_to_csv(common / "candidate_summary.csv", compact_all or [{"note": "none"}])
-    rows_to_csv(common / "intraday_summary.csv", intra_cands or [{"note": "none"}])
+    detailed = explorer_payload.get("intraday_fetch_by_ticker") or {}
+    intraday_rows = {r["ticker"]: dict(r) for r in intra_cands}
+    for ticker, result in detailed.items():
+        intraday_rows[ticker] = {**intraday_rows.get(ticker, {}), **result, "ticker": ticker}
+    rows_to_csv(common / "intraday_summary.csv", [
+        {**{k: v for k, v in row.items() if k not in {"intraday", "intraday_ohlcv", "ohlcv"}},
+         "ohlcv_files": "intraday_1m.jsonl|intraday_5m.jsonl|intraday_15m.jsonl"}
+        for row in intraday_rows.values()
+    ] or [{"note": "none"}])
+    write_json(common / "intraday_fetch_by_ticker.json", detailed)
+    write_json(common / "daily_collection_report.json", explorer_payload.get("daily_collection_report") or {"status": "UNAVAILABLE"})
+    write_json(common / "supplemental_market_snapshot.json", (explorer_payload.get("daily_collection_report") or {}).get("supplemental_market_snapshot") or {"status": "NOT_REQUESTED"})
+    write_json(common / "daily_data_status.json", explorer_payload.get("daily_data_status") or [])
     funnel_rows = []
     for c in candidates:
         fc = c.get("funnel_context") or {}
@@ -506,6 +761,19 @@ def prepare_schedule_handoffs(
         })
     rows_to_csv(common / "funnel_context.csv", funnel_rows or [{"note": "none"}])
     write_json(common / "provider_quality.json", {"execution_grade": "NO", "missing": ["depth", "trades", "bid_ask", "official_egx_calendar"]})
+    uni_cov = explorer_payload.get("universe_coverage") or uni_cov
+    write_json(common / "universe_coverage.json", uni_cov)
+    write_json(common / "missing_ticker_recovery_log.json", explorer_payload.get("missing_ticker_recovery_log") or [])
+    write_json(common / "session_snapshots.json", explorer_payload.get("session_snapshots") or {})
+    if explorer_package_dir:
+        pkg = Path(explorer_package_dir)
+        import shutil
+        for name in ("intraday_1m.jsonl", "intraday_5m.jsonl", "intraday_15m.jsonl", "universe_identity.csv", "daily_ohlcv.jsonl", "daily_rejected_ohlcv.jsonl", "daily_collection_rejections.jsonl"):
+            src = pkg / name
+            if src.exists():
+                shutil.copy2(src, common / name)
+    rows_to_csv(common / "universe_identity.csv", identity_rows or [{"note": "none"}])
+    write_json(common / "intraday_fetch_diagnostics.json", fetch_diag or {})
     write_json(common / "data_limitations.json", {
         "limitations": limitations,
         "session": sess,
@@ -566,6 +834,7 @@ def prepare_schedule_handoffs(
         "funnel_coverage_meta": funnel_meta,
         "weekly_history": weekly,
         "live_session_evidence_available": live_available,
+        "data_stamp": data_stamp,
     }
     schemas_dir = common / "schemas"
     schemas_dir.mkdir(parents=True, exist_ok=True)
@@ -582,9 +851,10 @@ def prepare_schedule_handoffs(
         write_workspace_file=env == PRODUCTION,
     )
 
+    write_package_stamp(out_root, data_stamp)
     written_jobs = {}
     for job in jobs:
-        text = RENDERERS[job](job_ctx)
+        text = job_stamp_preamble(data_stamp) + RENDERERS[job](job_ctx)
         write_text(jobs_dir / JOB_FILE[job], text)
         written_jobs[job] = text
 
@@ -598,14 +868,46 @@ def prepare_schedule_handoffs(
         "not_a_probability": True,
         "ai_mode": AI_CHATGPT_HANDOFF,
         "generated_at": generated_at,
+        "generated_at_cairo": data_stamp.get("packaged_at_cairo"),
+        "source_cutoff_cairo": (data_stamp.get("intraday") or {}).get("last_bar_cairo") or data_stamp.get("packaged_at_cairo"),
+        "source_cutoff_by_provider": {
+            "yahoo": explorer_payload.get("latest_completed_market_session"),
+            "tradingview": (data_stamp.get("intraday") or {}).get("last_bar_cairo"),
+        },
+        "latest_bar_timestamp": (data_stamp.get("intraday") or {}).get("last_bar_utc"),
+        "latest_trade_timestamp": None,
+        "latest_depth_timestamp": None,
+        "data_stamp": data_stamp,
         "latest_completed_market_session": latest_session,
         "target_next_working_day": "UNKNOWN",
         "session_phase": sess.get("session_phase"),
         "equity_universe_total": counts.get("EQUITY_UNIVERSE_TOTAL"),
         "scanner_eligible": counts.get("SCANNER_ELIGIBLE_SYMBOLS"),
+        "universe_expected": uni_cov.get("expected_equities"),
+        "universe_eligible": uni_cov.get("scanner_eligible"),
+        "universe_covered": uni_cov.get("covered"),
+        "intraday_basic_count": counts.get("INTRADAY_BASIC", 0),
+        "daily_snapshot_count": counts.get("DAILY_SNAPSHOTS", 0),
+        "intraday_deep_enriched_count": counts.get("INTRADAY_ENRICHED"),
+        "intraday_ohlcv_count": counts.get("INTRADAY_OHLCV"),
+        "trade_tape_count": 0,
+        "depth_count": 0,
+        "missing_tickers": uni_cov.get("missing_tickers") or [],
+        "recovered_tickers": list(explorer_payload.get("recovered_tickers") or []),
+        "alias_corrections": list(explorer_payload.get("alias_corrections") or []),
+        "coverage_status": uni_cov.get("coverage_status") or coverage.get("EXPLORER_COVERAGE"),
+        "run_scope": uni_cov.get("run_scope") or coverage.get("selection_basis"),
+        "lookahead_guard_pass": bool(explorer_payload.get("lookahead_guard_pass", True)),
+        "future_timestamp_records_rejected": int(explorer_payload.get("future_timestamp_records_rejected") or 0),
+        "stale_records_rejected": int(explorer_payload.get("stale_records_rejected") or 0),
+        "universe_coverage": uni_cov,
         "prescreen_count": counts.get("PRESCREEN_SELECTED"),
         "handoff_candidate_count": counts.get("HANDOFF_CANDIDATES") or len(candidates),
         "intraday_enriched_count": counts.get("INTRADAY_ENRICHED"),
+        "intraday_fetch_diagnostics": fetch_diag,
+        "exploratory_coverage_quality": coverage.get("exploratory_coverage_quality") or coverage.get("EXPLORER_COVERAGE"),
+        "whole_egx_claim_allowed": bool(uni_cov.get("whole_egx_claim_allowed")),
+        "market_wide_confidence_allowed": bool(uni_cov.get("whole_egx_claim_allowed")),
         "EXPLORER_COVERAGE": coverage.get("EXPLORER_COVERAGE"),
         "selection_basis": coverage.get("selection_basis"),
         "selection_bias_risk": coverage.get("selection_bias_risk"),
@@ -641,8 +943,9 @@ def prepare_schedule_handoffs(
     write_json(out_root / "manifest.json", manifest)
 
     zip_root = out_root.parent
-    combined_zip = zip_root / f"EGX_5_SCHEDULE_HANDOFF_{run_id}.zip"
-    zip_directory(out_root, combined_zip, arc_root="EGX_5_SCHEDULE_HANDOFF")
+    combined_zip = zip_root / dated_zip_name("EGX_CHATGPT_HANDOFF", data_stamp)
+    zip_directory(out_root, combined_zip, arc_root="EGX_CHATGPT_HANDOFF")
+    write_zip_sidecar(combined_zip, data_stamp)
 
     individual = {}
     import shutil
@@ -654,6 +957,10 @@ def prepare_schedule_handoffs(
         (job_root / "common").mkdir(parents=True, exist_ok=True)
         shutil.copy2(jobs_dir / JOB_FILE[job], job_root / "jobs" / JOB_FILE[job])
         shutil.copy2(common / "data_limitations.json", job_root / "common" / "data_limitations.json")
+        shutil.copy2(common / "daily_collection_report.json", job_root / "common" / "daily_collection_report.json")
+        shutil.copy2(common / "supplemental_market_snapshot.json", job_root / "common" / "supplemental_market_snapshot.json")
+        shutil.copy2(out_root / "DATA_STAMP.md", job_root / "DATA_STAMP.md")
+        shutil.copy2(out_root / "DATA_STAMP.json", job_root / "DATA_STAMP.json")
         job_schema_name = RESULT_SCHEMA_FILES[job]
         (job_root / "common" / "schemas").mkdir(parents=True, exist_ok=True)
         shutil.copy2(common / "schemas" / job_schema_name, job_root / "common" / "schemas" / job_schema_name)
@@ -665,6 +972,10 @@ def prepare_schedule_handoffs(
             shutil.copy2(common / "candidate_summary.csv", job_root / "common" / "candidate_summary.csv")
         elif job == ANALYSIS_INTRADAY:
             shutil.copy2(common / "intraday_summary.csv", job_root / "common" / "intraday_summary.csv")
+            for name in ("intraday_1m.jsonl", "intraday_5m.jsonl", "intraday_15m.jsonl", "universe_coverage.json", "intraday_fetch_by_ticker.json", "intraday_fetch_diagnostics.json"):
+                src = common / name
+                if src.exists():
+                    shutil.copy2(src, job_root / "common" / name)
         elif job == ANALYSIS_VALUE:
             shutil.copy2(common / "funnel_context.csv", job_root / "common" / "funnel_context.csv")
             shutil.copy2(common / "candidate_summary.csv", job_root / "common" / "candidate_summary.csv")
@@ -688,17 +999,19 @@ def prepare_schedule_handoffs(
             "included_jobs": [job],
             "references_full_package": str(combined_zip),
             "job_minimized": True,
+            "data_stamp": data_stamp,
         }
         write_json(job_root / "manifest.json", job_man)
-        zpath = zip_root / f"{JOB_ZIP_PREFIX[job]}_{run_id}.zip"
+        zpath = zip_root / dated_zip_name(JOB_ZIP_PREFIX[job], data_stamp)
         zip_directory(job_root, zpath, arc_root=JOB_ZIP_PREFIX[job])
+        write_zip_sidecar(zpath, data_stamp)
         individual[job] = str(zpath)
     shutil.rmtree(tmp_parent, ignore_errors=True)
 
     if store:
         store.insert_schedule_run(run_id, manifest, package_dir=str(out_root))
 
-    if env == PRODUCTION:
+    if env == PRODUCTION and output_root is None:
         ws = HERE / "workspace" / "schedule"
         ws.mkdir(parents=True, exist_ok=True)
         write_json(ws / "last_run.json", {

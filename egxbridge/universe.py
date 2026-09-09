@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import json
 import re
 
-from egxbridge.freshness import classify_freshness
+from egxbridge.symbols import canonicalize_any, load_name_aliases
 
 
 HERE = Path(__file__).resolve().parent.parent
@@ -32,10 +31,6 @@ EXCLUDED_FROM_STOCK_EXPLORER = {INDEX, RIGHT, WARRANT}
 NOT_ORDINARY_EQUITY = {INDEX, FUND, ETF, RIGHT, WARRANT, OTHER}
 
 _INDEX_RE = re.compile(r"^EGX\d+", re.IGNORECASE)
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _load_json(path: Path) -> Any:
@@ -125,7 +120,7 @@ class UniverseRecord:
     security_type: str = EQUITY
     sector_if_known: str = ""
     industry_if_known: str = ""
-    is_active_if_known: bool | None = True
+    is_active_if_known: bool | None = None
     is_tradable_candidate: bool = True
     source: str = ""
     last_verified_at: str = ""
@@ -143,8 +138,6 @@ class UniverseRecord:
                 self.provider_alias_egid = self.canonical_symbol
         else:
             self.exclusion_reason = self.exclusion_reason or "NO_MAPPING"
-        if not self.last_verified_at:
-            self.last_verified_at = _now()
         self.is_tradable_candidate = (
             self.security_type == EQUITY and self.is_active_if_known is not False and self.mapped
         )
@@ -153,47 +146,55 @@ class UniverseRecord:
         return asdict(self)
 
 
+def _canonicalize_symbols(raw: list[str]) -> list[str]:
+    """Collapse ticker + issuer-name aliases to one security identity."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in raw or []:
+        c = canonicalize_any(s)
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return sorted(out)
+
+
 def _reference_symbols() -> list[str]:
     return _symbols_from_payload(_load_json(REF_UNIVERSE) or [])
 
 
-def _provider_universe() -> tuple[list[str], str]:
-    try:
-        from egxbridge.config import Settings
-        settings = Settings.load(HERE / "config.json")
-    except Exception:
-        settings = None
+def _provider_universe(settings=None, root: Path | None = None) -> tuple[list[dict[str, Any]], str]:
+    """Merge imported and last-good discovered records; a seed never masks a catalog."""
+    from egxbridge.config import Settings
+    from egxbridge.providers.investor_egx import InvestorEGXProvider
 
-    if settings and settings.investor_egx_universe_path:
-        p = Path(settings.investor_egx_universe_path)
-        if not p.is_absolute():
-            p = HERE / p
-        syms = _symbols_from_payload(_load_json(p) or [])
-        if syms:
-            return syms, "investor_egx_universe_path"
-
-    try:
-        from egxbridge.providers.investor_egx import InvestorEGXProvider
-        kwargs: dict[str, Any] = {"enabled": True}
-        if settings:
-            kwargs["universe_path"] = settings.investor_egx_universe_path or ""
-            kwargs["sqlite_path"] = settings.investor_egx_sqlite_path or ""
-        prov = InvestorEGXProvider(**kwargs)
-        rows = prov.get_universe()
-        syms = [str(r.get("canonical")).upper() for r in rows if r.get("canonical")]
-        src = "investor_egx"
-        if syms and all(r.get("source") == "seed" for r in rows if isinstance(r, dict)):
-            src = "investor_egx_seed"
-        if syms:
-            return syms, src
-    except Exception:
-        pass
-
-    uni = HERE / "output" / "universe.json"
-    syms = _symbols_from_payload(_load_json(uni) or [])
-    if syms:
-        return syms, "output/universe.json"
-    return [], "none"
+    root = root or HERE
+    settings = settings or Settings.load(root / "config.json")
+    records = []
+    sources = []
+    if (settings.enabled_providers or {}).get("investor_egx", True):
+        def local_path(value):
+            return str(root / value) if value and not Path(value).is_absolute() else value
+        try:
+            records.extend(InvestorEGXProvider(
+                universe_path=local_path(settings.investor_egx_universe_path),
+                sqlite_path=local_path(settings.investor_egx_sqlite_path),
+            ).get_universe())
+            sources.append("investor_egx")
+        except Exception:
+            sources.append("investor_egx_unavailable")
+    output = Path(settings.output_dir)
+    if not output.is_absolute():
+        output = root / output
+    saved = _load_json(output / "universe.json") or {}
+    saved_rows = saved.get("records") if isinstance(saved, dict) else None
+    if saved_rows:
+        records.extend(saved_rows)
+    else:
+        records.extend({"canonical": s, "source": "cached_discovery"} for s in _symbols_from_payload(saved))
+    if saved:
+        sources.append("cached_discovery")
+    return records, "+".join(sources) or "none"
 
 
 def _db_symbols(db) -> list[str]:
@@ -213,11 +214,11 @@ def _db_symbols(db) -> list[str]:
     return sorted({str(s).upper() for s in out if s})
 
 
-def _config_symbols() -> tuple[list[str], dict[str, dict[str, str]]]:
+def _config_symbols(settings=None) -> tuple[list[str], dict[str, dict[str, str]]]:
     aliases: dict[str, dict[str, str]] = {}
     try:
         from egxbridge.config import Settings
-        settings = Settings.load(HERE / "config.json")
+        settings = settings or Settings.load(HERE / "config.json")
         keys = list((settings.symbol_aliases or {}).keys())
         for k, v in (settings.symbol_aliases or {}).items():
             if isinstance(v, dict):
@@ -242,22 +243,27 @@ def build_canonical_universe(
     *,
     explicit: list[str] | None = None,
     include_non_equity_in_registry: bool = True,
+    settings=None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     """Build canonical EGX records. Never hard-codes a 10-name list."""
     type_map = load_security_type_map()
-    cfg_syms, cfg_aliases = _config_symbols()
+    cfg_syms, cfg_aliases = _config_symbols(settings)
+    provider_rows, psrc = _provider_universe(settings, root)
+    metadata = {canonicalize_any(r.get("canonical") or r.get("symbol")): r for r in provider_rows}
+    name_aliases = load_name_aliases()
     sources: list[str] = []
 
     if explicit:
-        symbols = sorted({s.upper().strip() for s in explicit if s and str(s).strip()})
+        symbols = _canonicalize_symbols([s for s in explicit if s and str(s).strip()])
         source = "explicit"
         provider_syms: list[str] = []
         ref: list[str] = []
     else:
-        provider_syms, psrc = _provider_universe()
+        provider_syms = list(metadata)
         ref = _reference_symbols()
         db_syms = _db_symbols(db)
-        symbols = sorted(set(ref) | set(provider_syms) | set(cfg_syms) | set(db_syms))
+        symbols = _canonicalize_symbols(list(ref) + list(provider_syms) + list(cfg_syms) + list(db_syms))
         source = f"{psrc}+reference_registry+config+db"
         sources = [psrc, "egx_reference_universe", "config", "db"]
 
@@ -265,21 +271,28 @@ def build_canonical_universe(
     by_type: dict[str, int] = {t: 0 for t in sorted(SECURITY_TYPES)}
 
     for sym in symbols:
+        info = metadata.get(sym) or {}
         al = dict(_registry_aliases(sym))
+        al.update(info.get("aliases") or {})
         al.update(cfg_aliases.get(sym) or {})
+        names = list(name_aliases.get(sym) or [])
+        display = ""
+        named = [n for n in names if str(n).strip() and str(n).upper() != sym]
+        if named:
+            display = max(named, key=lambda s: len(str(s)))
         rec = UniverseRecord(
             canonical_symbol=sym,
-            display_name_if_known="",
+            display_name_if_known=info.get("name") or display,
             provider_alias_yahoo=al.get("yahoo") or yahoo_alias(sym),
             provider_alias_tradingview=al.get("tradingview") or tradingview_alias(sym),
             provider_alias_egid=al.get("egid") or al.get("borsa") or sym,
             provider_alias_other=al.get("borsa") or "",
-            security_type=classify_security_type(sym, explicit_map=type_map),
+            security_type=type_map.get(sym) or info.get("security_type") or classify_security_type(sym, name=info.get("name") or "", explicit_map=type_map),
             sector_if_known="",
             industry_if_known="",
-            is_active_if_known=True,
-            source=source,
-            last_verified_at=_now(),
+            is_active_if_known=info.get("is_active_if_known"),
+            source=info.get("source") or source,
+            last_verified_at=info.get("last_verified_at") or "",
             mapped=bool(al.get("yahoo") or yahoo_alias(sym)),
         )
         if rec.security_type in EXCLUDED_FROM_STOCK_EXPLORER:
@@ -301,6 +314,8 @@ def build_canonical_universe(
     equity = [r for r in records if r.security_type == EQUITY]
     stock_default = [r for r in records if r.is_tradable_candidate]
     return {
+        "catalog_status": "PROVIDER_CATALOG" if any(r.get("source") == "tradingview" for r in provider_rows) else "UNVERIFIED_LOCAL_REGISTRY",
+        "exchange_completeness_verified": False,
         "records": records,
         "records_by_symbol": {r.canonical_symbol: r for r in records},
         "universe_source": source,
@@ -316,37 +331,24 @@ def build_canonical_universe(
     }
 
 
-def _daily_stats(db, symbol: str) -> dict[str, Any]:
-    if db is None:
-        return {"count": 0, "latest_session": None, "latest_ts": None, "provider": None}
-    try:
-        row = db._conn.execute(
-            """SELECT COUNT(*) AS c FROM candles WHERE symbol=? AND interval='1d'""",
-            (symbol.upper(),),
-        ).fetchone()
-        count = int(row["c"] if hasattr(row, "keys") else row[0])
-    except Exception:
-        count = 0
-    latest_session = None
-    latest_ts = None
-    provider = None
-    try:
-        rows = db.fetch_candles(symbol, "1d", limit=5)
-        if rows:
-            # fetch_candles is DESC
-            latest = rows[0]
-            latest_session = latest.get("session_date")
-            latest_ts = latest.get("normalized_utc_timestamp") or latest.get("timestamp")
-            provider = latest.get("provider")
-            if not latest_session and latest_ts:
-                latest_session = str(latest_ts)[:10]
-    except Exception:
-        pass
+def _daily_stats(db, symbol: str, *, as_of=None) -> dict[str, Any]:
+    from egxbridge.daily_bars import select_daily_pool, session_of, completed_session_rows, ohlcv_issue
+    from egxbridge.semantics import previous_egx_session_date
+    rows = db.fetch_candles(symbol, "1d", limit=5000) if db is not None else []
+    invalid = [r for r in completed_session_rows(rows, as_of=as_of) if ohlcv_issue(r)]
+    pool, provider, _ = select_daily_pool(rows, as_of=as_of)
+    latest = pool[-1] if pool else {}
+    expected = previous_egx_session_date(as_of)
+    session = session_of(latest) or None
     return {
-        "count": count,
-        "latest_session": latest_session,
-        "latest_ts": latest_ts,
-        "provider": provider,
+        "count": len(pool), "latest_session": session,
+        "first_session": session_of(pool[0]) if pool else None,
+        "latest_ts": latest.get("normalized_utc_timestamp") or latest.get("timestamp"),
+        "captured_at": latest.get("capture_timestamp"), "provider": provider,
+        "expected_session": expected,
+        "data_state": "MISSING" if not pool else "STALE" if session < expected else "CURRENT",
+        "invalid_daily_bars": len(invalid),
+        "latest_invalid_session": max((session_of(r) for r in invalid), default=None),
     }
 
 
@@ -356,6 +358,7 @@ def assess_universe_coverage(
     *,
     min_scanner_bars: int = 20,
     stock_explorer_only: bool = True,
+    as_of=None,
 ) -> dict[str, Any]:
     """Attach daily-data / scanner eligibility. Never silently drop a symbol."""
     records: list[UniverseRecord] = list(built.get("records") or [])
@@ -368,6 +371,7 @@ def assess_universe_coverage(
     scanner_eligible: list[str] = []
     reasons: dict[str, str] = {}
     status_by_symbol: dict[str, dict[str, Any]] = {}
+    name_aliases = load_name_aliases()
 
     target = records
     if stock_explorer_only:
@@ -381,11 +385,11 @@ def assess_universe_coverage(
         else:
             unmapped.append(sym)
 
-        stats = _daily_stats(db, sym)
+        stats = _daily_stats(db, sym, as_of=as_of)
         count = int(stats.get("count") or 0)
         freshness = "UNKNOWN"
         if stats.get("latest_ts"):
-            freshness, _ = classify_freshness(stats["latest_ts"])
+            freshness = "STALE_UNEXPECTED" if stats["data_state"] == "STALE" else "STALE_EXPECTED"
 
         if rec.security_type in EXCLUDED_FROM_STOCK_EXPLORER:
             reason = rec.exclusion_reason or f"EXCLUDED_{rec.security_type}"
@@ -402,8 +406,8 @@ def assess_universe_coverage(
         elif rec.security_type == EQUITY:
             if count <= 0:
                 daily_unavailable.append(sym)
-                reason = "DAILY_DATA_UNAVAILABLE"
-                data_status = "DAILY_DATA_UNAVAILABLE"
+                reason = "INVALID_DAILY_OHLCV" if stats.get("invalid_daily_bars") else "DAILY_DATA_UNAVAILABLE"
+                data_status = reason
             else:
                 daily_available.append(sym)
                 if freshness == "STALE_UNEXPECTED":
@@ -415,6 +419,9 @@ def assess_universe_coverage(
                 if count < min_scanner_bars:
                     reason = "INSUFFICIENT_HISTORY"
                     data_status = "INSUFFICIENT_HISTORY"
+                elif stats["data_state"] != "CURRENT":
+                    reason = "STALE_DAILY_SESSION"
+                    data_status = "STALE_DAILY_SESSION"
                 else:
                     scanner_eligible.append(sym)
                     reason = "SCANNER_ELIGIBLE"
@@ -427,12 +434,31 @@ def assess_universe_coverage(
         reasons[sym] = reason or data_status
         status_by_symbol[sym] = {
             "ticker": sym,
+            "canonical_ticker": sym,
+            "security_id": rec.provider_alias_egid or sym,
+            "current_name": rec.display_name_if_known or "",
+            "aliases": [a for a in dict.fromkeys(
+                [sym, rec.display_name_if_known, rec.provider_alias_yahoo, rec.provider_alias_tradingview]
+                + list(name_aliases.get(sym) or [])
+            ) if a],
+            "exchange": "EGX",
+            "instrument_type": rec.security_type,
             "security_type": rec.security_type,
             "data_status": data_status,
             "exclusion_reason": reasons[sym],
+            "eligibility_reason": reasons[sym],
             "mapped": rec.mapped,
             "is_tradable_candidate": rec.is_tradable_candidate,
             "daily_bars": count,
+            "invalid_daily_bars": stats.get("invalid_daily_bars", 0),
+            "latest_invalid_session": stats.get("latest_invalid_session"),
+            "first_session": stats.get("first_session"),
+            "provider": stats.get("provider"),
+            "data_captured_at": stats.get("captured_at"),
+            "data_state": stats.get("data_state"),
+            "expected_session": stats.get("expected_session"),
+            "daily_bars_lagging": stats.get("data_state") != "CURRENT",
+            "source_timestamp": stats.get("latest_ts"),
             "latest_session": stats.get("latest_session"),
             "freshness_class": freshness,
             "yahoo_alias": rec.provider_alias_yahoo,
